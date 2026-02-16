@@ -40,15 +40,6 @@ def get_train_eval_split_fraction(image_filenames: List, train_split_fraction: f
     i_eval = np.setdiff1d(i_all, i_train)  # eval images are the remaining images
     assert len(i_eval) == num_eval_images
 
-    print(f"\n\n\n\n\n**********************************")
-    print(f"Train/Eval split fraction: {train_split_fraction}")
-    print(f"Total images: {num_images}")
-    print(f"Train images: {num_train_images}, Eval images: {num_eval_images}")
-    print(f"Train fraction: {train_split_fraction}, Eval fraction: {1 - train_split_fraction}")
-    print(f"Train indices: \n{i_train}")
-    print(f"Eval indices: \n{i_eval}")
-    print(f"**********************************\n\n\n\n\n")
-
     return i_train, i_eval
 
 
@@ -92,14 +83,6 @@ def get_train_eval_split_interval(image_filenames: List, eval_interval: float) -
     eval_indices = all_indices[all_indices % eval_interval == 0]
     i_train = train_indices
     i_eval = eval_indices
-
-    print(f"\n\n\n\n\n**********************************")
-    print(f"Train/Eval split interval: {eval_interval}")
-    print(f"Total images: {num_images}")
-    print(f"Train images: {len(i_train)}, Eval images: {len(i_eval)}")
-    print(f"Train indices: \n{i_train}")
-    print(f"Eval indices: \n{i_eval}")
-    print(f"**********************************\n\n\n\n\n")
 
     return i_train, i_eval
 
