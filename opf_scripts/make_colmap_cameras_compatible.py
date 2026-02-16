@@ -3,7 +3,6 @@ Opens the colmap cameras file and changes the format from Full_OpenCV to OpenCV,
 is needed for nerfstudio.
 '''
 
-import json
 import pathlib
 
 import argparse
