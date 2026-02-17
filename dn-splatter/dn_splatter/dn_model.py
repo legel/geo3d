@@ -30,9 +30,7 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat import rasterize_gaussians
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
-from gsplat.cuda_legacy._wrapper import num_sh_bases
+from nerfstudio.utils.spherical_harmonics import num_sh_bases
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -50,6 +48,18 @@ from nerfstudio.models.splatfacto import (
 )
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
+
+
+def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
+    """Convert quaternions (wxyz convention) to rotation matrices."""
+    quats = F.normalize(quats, p=2, dim=-1)
+    w, x, y, z = torch.unbind(quats, dim=-1)
+    mat = torch.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    ], dim=-1)
+    return mat.reshape(quats.shape[:-1] + (3, 3))
 
 
 @dataclass
@@ -97,6 +107,8 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     """Threshold for clipping opacities"""
     two_d_gaussians: bool = True
     """Encourage 2D Gaussians"""
+    continue_cull_post_densification: bool = True
+    """Continue to cull gaussians after densification stops"""
 
     ### Splatfacto configs ###
     warmup_length: int = 500
@@ -267,6 +279,35 @@ class DNSplatterModel(SplatfactoModel):
     @property
     def normals(self):
         return self.gauss_params["normals"]
+
+    def step_cb(self, step):
+        self.step = step
+
+    def after_train(self, step):
+        assert step == self.step
+        if self.step >= self.config.stop_split_at:
+            return
+        with torch.no_grad():
+            visible_mask = (self.radii > 0).flatten()
+            if hasattr(self.xys, 'absgrad') and self.xys.absgrad is not None:
+                grads = self.xys.absgrad[0][visible_mask].norm(dim=-1)
+            elif self.xys.grad is not None:
+                grads = self.xys.grad[0][visible_mask].abs().norm(dim=-1)
+            else:
+                return
+            if self.xys_grad_norm is None:
+                self.xys_grad_norm = torch.zeros(self.num_points, device=self.device)
+                self.vis_counts = torch.ones(self.num_points, device=self.device)
+            assert self.vis_counts is not None
+            self.vis_counts[visible_mask] += 1
+            self.xys_grad_norm[visible_mask] += grads
+            if self.max_2Dsize is None:
+                self.max_2Dsize = torch.zeros(self.num_points, device=self.device)
+            newradii = self.radii.detach()[visible_mask]
+            self.max_2Dsize[visible_mask] = torch.maximum(
+                self.max_2Dsize[visible_mask],
+                newradii / float(max(self.last_size[0], self.last_size[1])),
+            )
 
     def refinement_after(self, optimizers: Optimizers, step):
         assert step == self.step
@@ -559,20 +600,27 @@ class DNSplatterModel(SplatfactoModel):
             # convert normals from world space to camera space
             normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
 
-            xys = self.xys[0, ...].detach()
-
-            normals_im: Tensor = rasterize_gaussians(  # type: ignore
-                xys,
-                self.depths[0, ...],
-                self.radii,
-                self.conics[0, ...],
-                self.num_tiles_hit[0, ...],
-                normals,
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_WIDTH,
+            normals_raster, _, _ = rasterization(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=normals,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                absgrad=False,
+                rasterize_mode=self.config.rasterize_mode,
             )
+            normals_im = normals_raster.squeeze(0)
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2

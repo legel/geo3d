@@ -25,8 +25,6 @@ from dn_splatter.utils.utils import (
     save_img,
     save_normal,
 )
-from dn_splatter.scripts.dsine.dsine_predictor import DSinePredictor
-from omnidata_tools.torch.modules.midas.dpt_depth import DPTDepthModel
 from rich.console import Console
 from tqdm import tqdm
 
@@ -117,6 +115,7 @@ def run_monocular_dsine(
         save_path = images[0].parent.parent / "normals_from_pretrain"
     save_path.mkdir(exist_ok=True, parents=True)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    from dn_splatter.scripts.dsine.dsine_predictor import DSinePredictor
     model = DSinePredictor(device=device)
 
     image_list = images
@@ -174,6 +173,7 @@ def run_monocular_normals(
     omnidata_pretrained_weights_path = (
         omnidata_pretrained_weights_path / "omnidata_dpt_normal_v2.ckpt"
     )
+    from omnidata_tools.torch.modules.midas.dpt_depth import DPTDepthModel
     model = DPTDepthModel(backbone="vitb_rn50_384", num_channels=3)  # DPT Hybrid
     checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location)
     if "state_dict" in checkpoint:
@@ -307,6 +307,7 @@ def normals_from_pretrain(
     omnidata_pretrained_weights_path = (
         omnidata_pretrained_weights_path / "omnidata_dpt_normal_v2.ckpt"
     )
+    from omnidata_tools.torch.modules.midas.dpt_depth import DPTDepthModel
     model = DPTDepthModel(backbone="vitb_rn50_384", num_channels=3)  # DPT Hybrid
     checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location)
     if "state_dict" in checkpoint:

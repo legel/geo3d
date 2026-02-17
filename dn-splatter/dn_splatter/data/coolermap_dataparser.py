@@ -10,10 +10,6 @@ import numpy as np
 import open3d as o3d
 import torch
 from dn_splatter.scripts.align_depth import ColmapToAlignedMonoDepths
-from dn_splatter.scripts.normals_from_pretrain import (
-    NormalsFromPretrained,
-    normals_from_depths,
-)
 from natsort import natsorted
 from rich.console import Console
 
@@ -282,6 +278,10 @@ class CoolerMapDataParser(ColmapDataParser):
                 f"[bold yellow]Could not find normals, generating them into {str(self.normal_save_dir)}"
             )
             self.normal_save_dir.mkdir(exist_ok=True, parents=True)
+            from dn_splatter.scripts.normals_from_pretrain import (
+                NormalsFromPretrained,
+                normals_from_depths,
+            )
             if self.config.normals_from == "depth":
                 normals_from_depths(
                     path_to_transforms=Path(image_filenames[0]).parent.parent
