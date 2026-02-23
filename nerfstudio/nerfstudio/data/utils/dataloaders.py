@@ -100,23 +100,16 @@ def _undistort_image(
         K[1, 2] = K[1, 2] - 0.5
         if np.any(distortion_params):
             newK, roi = cv2.getOptimalNewCameraMatrix(K, distortion_params, (image.shape[1], image.shape[0]), 0)
-            print(f"SHAPE BEFORE UNDISTORT: {image.shape}")
             image = cv2.undistort(image, K, distortion_params, None, newK)  # type: ignore
-            print(f"SHAPE AFTER UNDISTORT: {image.shape}")
         else:
             newK = K
             roi = 0, 0, image.shape[1], image.shape[0]
         # crop the image and update the intrinsics accordingly
         x, y, w, h = roi
-        # image = image[y : y + h, x : x + w]
-
-        # off by one in roi
-        image = image[y : y + h + 1, x : x + w + 1]
+        image = image[y : y + h, x : x + w]
 
         newK[0, 2] -= x
         newK[1, 2] -= y
-
-        print(f"SHAPE AFTER CROP: {image.shape}")
 
         if "depth_image" in data:
             data["depth_image"] = data["depth_image"][y : y + h, x : x + w]
