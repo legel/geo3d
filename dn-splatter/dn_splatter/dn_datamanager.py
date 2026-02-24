@@ -17,6 +17,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
     FullImageDatamanagerConfig,
 )
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.utils.rich_utils import CONSOLE
 
 
 @dataclass
@@ -68,8 +69,26 @@ class DNSplatterDataManager(FullImageDatamanager):
         )
 
         self.load_normals = True if ("normal_filenames" in metadata) else False
-        self.load_confidence = True if ("confidence_filenames" in metadata) else False
+        self.load_confidence = metadata.get("load_confidence", False)
         self.image_idx = 0
+
+        # Ground-only warmup: identify ground images (those with sensor depth maps)
+        self.ground_image_indices = None
+        if "is_ground_image" in metadata:
+            self.ground_image_indices = [
+                i for i, g in enumerate(metadata["is_ground_image"]) if g
+            ]
+
+        self._warmup_active = (
+            self.ground_image_indices is not None
+            and len(self.ground_image_indices) > 0
+        )
+        if self._warmup_active:
+            self.train_unseen_cameras = self._sample_ground_cameras()
+            CONSOLE.print(
+                f"[bold green]Ground-only warmup active: "
+                f"{len(self.ground_image_indices)}/{len(self.train_dataset)} images"
+            )
 
     def create_train_dataset(self) -> InputDataset:
         """Sets up the data loaders for training"""
@@ -87,13 +106,30 @@ class DNSplatterDataManager(FullImageDatamanager):
             scale_factor=self.config.camera_res_scale_factor,
         )
 
+    def _sample_ground_cameras(self):
+        """Return a shuffled list of ground-only camera indices for warmup phase."""
+        indices = list(self.ground_image_indices)
+        random.shuffle(indices)
+        return indices
+
+    def activate_full_training(self):
+        """Switch from ground-only warmup to full dataset training."""
+        self._warmup_active = False
+        self.train_unseen_cameras = self.sample_train_cameras()
+        CONSOLE.print(
+            "[bold magenta]===== PHASE TRANSITION: "
+            "Now training on ALL images (ground + drone) ====="
+        )
+
     def next_train(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next training batch"""
 
-        # Don't randomly sample train images (keep t-1, t, t+1 ordering).
         self.image_idx = self.train_unseen_cameras.pop(0)
         if len(self.train_unseen_cameras) == 0:
-            self.train_unseen_cameras = [i for i in range(len(self.train_dataset))]
+            if self._warmup_active:
+                self.train_unseen_cameras = self._sample_ground_cameras()
+            else:
+                self.train_unseen_cameras = self.sample_train_cameras()
         data = deepcopy(self.cached_train[self.image_idx])
         data["image"] = data["image"].to(self.device)
 

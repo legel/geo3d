@@ -60,6 +60,10 @@ class DNSplatterPipelineConfig(VanillaPipelineConfig):
     """Total number of points to extract from train/eval renders for pointcloud reconstruction"""
     save_train_images: bool = False
     """saving train images to disc"""
+    ground_warmup_steps: int = 10000
+    """Steps to train only on ground/handheld images with depth supervision before introducing drone images."""
+    depth_init: bool = True
+    """Initialize Gaussians from backprojected depth maps instead of COLMAP sparse points."""
 
 
 class DNSplatterPipeline(VanillaPipeline):
@@ -84,24 +88,32 @@ class DNSplatterPipeline(VanillaPipeline):
             local_rank=local_rank,
         )
         seed_pts = None
-        if (
-            hasattr(self.datamanager, "train_dataparser_outputs")
-            and "points3D_xyz"
-            in self.datamanager.train_dataparser_outputs.metadata  # type: ignore
-        ):
-            pts = self.datamanager.train_dataparser_outputs.metadata[
-                "points3D_xyz"
-            ]  # type: ignore
-            pts_rgb = self.datamanager.train_dataparser_outputs.metadata[
-                "points3D_rgb"
-            ]  # type: ignore
-            if "points3D_normals" in self.datamanager.train_dataparser_outputs.metadata:
-                normals = self.datamanager.train_dataparser_outputs.metadata[
-                    "points3D_normals"
-                ]  # type: ignore
+        metadata = getattr(
+            getattr(self.datamanager, "train_dataparser_outputs", None), "metadata", {}
+        )
+        if metadata and "points3D_xyz" in metadata:
+            # Prefer depth-projected seed points when depth_init is enabled
+            if self.config.depth_init and "depth_seed_points_xyz" in metadata:
+                pts = metadata["depth_seed_points_xyz"]
+                pts_rgb = metadata["depth_seed_points_rgb"]
+                CONSOLE.print(f"[bold green]Using depth-projected seed points: {pts.shape[0]:,}")
+                # Compute normals from dense point cloud via Open3D
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts.numpy())
+                pcd.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+                )
+                pcd.normalize_normals()
+                normals = torch.from_numpy(np.asarray(pcd.normals, dtype=np.float32))
                 seed_pts = (pts, pts_rgb, normals)
             else:
-                seed_pts = (pts, pts_rgb)
+                # Fall back to COLMAP sparse points
+                pts = metadata["points3D_xyz"]
+                pts_rgb = metadata["points3D_rgb"]
+                if "points3D_normals" in metadata:
+                    seed_pts = (pts, pts_rgb, metadata["points3D_normals"])
+                else:
+                    seed_pts = (pts, pts_rgb)
 
         # TODO(ethan): get rid of scene_bounds from the model
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
@@ -125,6 +137,17 @@ class DNSplatterPipeline(VanillaPipeline):
             dist.barrier(device_ids=[local_rank])
 
         self.pd_metrics = PDMetrics()
+
+    @profiler.time_function
+    def get_train_loss_dict(self, step: int):
+        """Override to handle ground-warmup phase transition at the configured step."""
+        if (
+            step == self.config.ground_warmup_steps
+            and hasattr(self.datamanager, "_warmup_active")
+            and self.datamanager._warmup_active
+        ):
+            self.datamanager.activate_full_training()
+        return super().get_train_loss_dict(step)
 
     @profiler.time_function
     def get_average_eval_image_metrics(
