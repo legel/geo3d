@@ -161,9 +161,8 @@ def put_time(name: str, duration: float, step: int, avg_over_steps: bool = True,
 def write_out_storage():
     """Function that writes all the events in storage to all the writer locations"""
     for writer in EVENT_WRITERS:
-        if isinstance(writer, LocalWriter) and len(EVENT_STORAGE) > 0:
-            writer.write_stats_log(EVENT_STORAGE[0]["step"])
-            continue
+        if isinstance(writer, LocalWriter):
+            continue  # suppress terminal table output; custom loss reporting in trainer.py
         for event in EVENT_STORAGE:
             write_func = getattr(writer, event["write_type"].value)
             write_func(event["name"], event["event"], event["step"])

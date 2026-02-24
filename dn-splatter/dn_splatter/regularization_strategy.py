@@ -144,7 +144,7 @@ class DNRegularization(RegularizationStrategy):
         self.normal_lambda = normal_lambda
 
     def get_loss(self, pred_depth, gt_depth, pred_normal, gt_normal, **kwargs):
-        """Regularization loss"""
+        """Regularization loss. Returns (total_loss, loss_dict) tuple."""
 
         depth_loss, normal_loss = 0.0, 0.0
         if self.depth_loss is not None and gt_depth is not None:
@@ -153,12 +153,20 @@ class DNRegularization(RegularizationStrategy):
             normal_loss = self.get_normal_loss(pred_normal, gt_normal, **kwargs)
         scales = kwargs["scales"]
         scale_loss = self.get_scale_loss(scales=scales)
-        return depth_loss + normal_loss + scale_loss
+        total = depth_loss + normal_loss + scale_loss
+        loss_dict = {
+            "depth_loss": torch.tensor(depth_loss) if isinstance(depth_loss, (int, float)) else depth_loss.detach(),
+            "normal_loss": torch.tensor(normal_loss) if isinstance(normal_loss, (int, float)) else normal_loss.detach(),
+        }
+        return total, loss_dict
 
     def get_depth_loss(self, pred_depth, gt_depth, **kwargs):
         """Depth loss"""
 
         valid_gt_mask = gt_depth > self.depth_tolerance
+        # Skip depth loss if no valid pixels (e.g., all depth zeroed by confidence mask)
+        if valid_gt_mask.sum() == 0:
+            return torch.tensor(0.0, device=pred_depth.device)
         if self.depth_loss_type == DepthLossType.EdgeAwareLogL1:
             gt_img = kwargs["gt_img"]
             depth_loss = self.depth_loss(
@@ -241,7 +249,7 @@ class AGSMeshRegularization(RegularizationStrategy):
         confidence_map,
         **kwargs,
     ):
-        """Regularization loss"""
+        """Regularization loss. Returns (total_loss, loss_dict) tuple."""
         depth_loss = self.get_depth_loss(
             step=step,
             pred_depth=pred_depth,
@@ -252,7 +260,12 @@ class AGSMeshRegularization(RegularizationStrategy):
         normal_loss = self.get_normal_loss(step, surf_normal, gt_normal, pred_normal)
         scales = kwargs["scales"]
         scale_loss = self.get_scale_loss(scales=scales)
-        return depth_loss + normal_loss + scale_loss
+        total = depth_loss + normal_loss + scale_loss
+        loss_dict = {
+            "depth_loss": torch.tensor(depth_loss) if isinstance(depth_loss, (int, float)) else depth_loss.detach(),
+            "normal_loss": torch.tensor(normal_loss) if isinstance(normal_loss, (int, float)) else normal_loss.detach(),
+        }
+        return total, loss_dict
 
     def get_depth_loss(self, step, pred_depth, gt_depth, confidence_map, **kwargs):
         """Depth loss"""

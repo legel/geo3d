@@ -239,6 +239,9 @@ class Trainer:
             )
 
         self._init_viewer_state()
+        # EMA loss tracking for clean reporting
+        _ema_alpha = 2.0 / (50 + 1)  # EMA smoothing for window ~50
+        _ema = {}  # key -> smoothed value
         with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
             num_iterations = self.config.max_num_iterations - self._start_step
             step = 0
@@ -284,19 +287,23 @@ class Trainer:
 
                 self._update_viewer_state(step)
 
-                # a batch of train rays
-                if step_check(step, self.config.logging.steps_per_log, run_at_zero=True):
-                    writer.put_scalar(name="Train Loss", scalar=loss, step=step)
-                    writer.put_dict(name="Train Loss Dict", scalar_dict=loss_dict, step=step)
-                    writer.put_dict(name="Train Metrics Dict", scalar_dict=metrics_dict, step=step)
-                    # The actual memory allocated by Pytorch. This is likely less than the amount
-                    # shown in nvidia-smi since some unused memory can be held by the caching
-                    # allocator and some context needs to be created on GPU. See Memory management
-                    # (https://pytorch.org/docs/stable/notes/cuda.html#cuda-memory-management)
-                    # for more details about GPU memory management.
-                    writer.put_scalar(
-                        name="GPU Memory (MB)", scalar=torch.cuda.max_memory_allocated() / (1024**2), step=step
-                    )
+                # Update EMA for all tracked losses (skip NaN to avoid poisoning)
+                model = self.pipeline.model
+                _cur = {"total": loss.item()}
+                for attr, label in [("_last_rgb_loss", "rgb"), ("_last_depth_loss", "depth"), ("_last_normal_loss", "normal")]:
+                    if hasattr(model, attr):
+                        v = getattr(model, attr)
+                        _cur[label] = v.item() if hasattr(v, "item") else float(v)
+                for k, v in _cur.items():
+                    if not (v != v):  # skip NaN
+                        _ema[k] = v if k not in _ema else _ema[k] * (1 - _ema_alpha) + v * _ema_alpha
+
+                if step % 50 == 0:
+                    parts = [f"Step {step:>5d}"]
+                    for k in ["total", "rgb", "depth", "normal"]:
+                        if k in _ema:
+                            parts.append(f"{k}: {_ema[k]:.4f}")
+                    CONSOLE.print("  |  ".join(parts))
 
                 # Do not perform evaluation if there are no validation images
                 if self.pipeline.datamanager.eval_dataset:

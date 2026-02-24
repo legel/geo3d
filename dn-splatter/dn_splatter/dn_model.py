@@ -259,9 +259,13 @@ class DNSplatterModel(SplatfactoModel):
         )
 
         if self.config.regularization_strategy == "dn-splatter":
-            self.regularization_strategy = DNRegularization()
+            self.regularization_strategy = DNRegularization(
+                depth_tolerance=self.config.depth_tolerance,
+            )
         elif self.config.regularization_strategy == "ags-mesh":
-            self.regularization_strategy = AGSMeshRegularization()
+            self.regularization_strategy = AGSMeshRegularization(
+                depth_tolerance=self.config.depth_tolerance,
+            )
         else:
             raise NotImplementedError
 
@@ -836,13 +840,15 @@ class DNSplatterModel(SplatfactoModel):
             depth_gt = mono_depth_gt
 
         if depth_gt is None and self.config.use_depth_loss:
-            CONSOLE.log(
-                "--pipeline.model.use-depth-loss is set to True but could not find depths to load. Remember to load depths in dataparser.",
-                style="bold yellow",
-            )
+            if not getattr(self, "_depth_warning_shown", False):
+                CONSOLE.log(
+                    "Some images have no depth data (expected for drone images without depth maps).",
+                    style="bold yellow",
+                )
+                self._depth_warning_shown = True
 
         if self.config.regularization_strategy == "dn-splatter":
-            regularization_strategy_loss = self.regularization_strategy(
+            regularization_strategy_loss, reg_loss_dict = self.regularization_strategy(
                 pred_depth=depth_out,
                 gt_depth=depth_gt,
                 pred_normal=pred_normal,
@@ -850,7 +856,7 @@ class DNSplatterModel(SplatfactoModel):
                 **additional_data,
             )
         elif self.config.regularization_strategy == "ags-mesh":
-            regularization_strategy_loss = self.regularization_strategy(
+            regularization_strategy_loss, reg_loss_dict = self.regularization_strategy(
                 step=self.step,
                 pred_depth=depth_out,
                 gt_depth=depth_gt,
@@ -862,6 +868,11 @@ class DNSplatterModel(SplatfactoModel):
             )
 
         main_loss = rgb_loss + regularization_strategy_loss
+
+        # Store individual losses for monitoring (not in loss_dict to avoid double-counting in trainer's sum)
+        self._last_rgb_loss = rgb_loss.detach()
+        self._last_depth_loss = reg_loss_dict["depth_loss"]
+        self._last_normal_loss = reg_loss_dict["normal_loss"]
 
         return {"main_loss": main_loss, "scale_reg": scale_reg}
 
