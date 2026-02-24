@@ -93,10 +93,12 @@ Verify DN-Splatter:
 ns-train dn-splatter --help
 ```
 
-### 6. Install pyopf (for Pix4D data conversion)
+### 6. Install Additional Dependencies
 
 ```bash
-pip install pyopf
+pip install pyopf           # Pix4D OPF data conversion
+pip install omnidata-tools  # Monocular normal estimation
+pip install open3d          # Point cloud normal estimation (used by coolermap dataparser)
 ```
 
 ### Troubleshooting
@@ -113,9 +115,41 @@ Replace `9.0` with your GPU's compute capability (e.g., `8.0` for A100, `8.9` fo
 
 ## Usage
 
+### Generating Normal Maps (Omnidata)
+
+Before training with normal supervision, generate monocular normal maps from a pretrained Omnidata model:
+
+```bash
+pip install omnidata-tools open3d
+
+# Download Omnidata weights (once)
+python dn-splatter/dn_splatter/scripts/normals_from_pretrain.py --help
+
+# Generate low-res (384x384) normals for a COLMAP dataset
+python -m dn_splatter.scripts.normals_from_pretrain --data-dir data/your_colmap_dataset --img-dir-name images
+```
+
+This creates `normals_from_pretrain/` inside your dataset directory with `.png` and `.npy` files at 384x384 resolution. The script supports parallel image loading (16 threads) and batched GPU inference for fast processing on large datasets.
+
 ### DN-Splatter (depth + normal supervised Gaussian splatting)
 
-Train with depth and normal supervision:
+Train with COLMAP data using the `coolermap` dataparser (supports loading precomputed normals):
+
+```bash
+ns-train dn-splatter \
+    --data data/your_colmap_dataset \
+    --pipeline.model.normal-supervision mono \
+    --pipeline.datamanager.cache-images gpu \
+    coolermap \
+    --load-normals True \
+    --load-depths False \
+    --orientation-method none \
+    --center-method none \
+    --auto-scale-poses False \
+    --scale-factor 0.01
+```
+
+For depth + normal supervision:
 
 ```bash
 ns-train dn-splatter \
@@ -134,6 +168,18 @@ See `dn-splatter/README.md` for full documentation on supported datasets, mesh e
 ```bash
 ns-train splatfacto --data PATH_TO_DATA
 ```
+
+### GPU Image Caching
+
+For machines with large VRAM (e.g., H200 with 143GB), cache all training images on GPU for faster training:
+
+```bash
+ns-train dn-splatter \
+    --pipeline.datamanager.cache-images gpu \
+    ...
+```
+
+The default nerfstudio behavior forces CPU caching for datasets with >500 images. This fork removes that restriction and lets you control caching directly.
 
 ### Pix4D Data Conversion
 
@@ -155,6 +201,15 @@ opf2nerf project.opf --out-dir out_dir/ --nerfstudio
 | DN-Splatter Big | `ns-train dn-splatter-big` | DN-Splatter variant with more Gaussians for higher quality |
 | Splatfacto | `ns-train splatfacto` | Standard nerfstudio Gaussian splatting |
 
+## Key Modifications from Upstream
+
+This fork includes several patches on top of nerfstudio v1.1.5 and DN-Splatter:
+
+- **DN-Splatter patched for nerfstudio v1.1.5 + gsplat 1.4.0 + Python 3.12** — replaced removed `gsplat.cuda_legacy` imports, updated rasterization API, bridged callback API changes
+- **Graceful handling of missing depth/normal data** — prevents crashes when running without complete ground truth
+- **GPU caching unlocked for large datasets** — removed the hardcoded 500-image limit that forced CPU caching
+- **Optimized normal generation** — parallel image loading, batched GPU inference, PyTorch 2.6 compatibility
+
 ## Version Information
 
 - Python: 3.12
@@ -162,3 +217,5 @@ opf2nerf project.opf --out-dir out_dir/ --nerfstudio
 - nerfstudio: 1.1.5 (local)
 - gsplat: 1.4.0
 - nerfacc: 0.5.2
+- omnidata-tools: for monocular normal estimation
+- open3d: for point cloud normal estimation
