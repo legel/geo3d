@@ -147,9 +147,9 @@ class DNRegularization(RegularizationStrategy):
         """Regularization loss"""
 
         depth_loss, normal_loss = 0.0, 0.0
-        if self.depth_loss is not None:
+        if self.depth_loss is not None and gt_depth is not None:
             depth_loss = self.get_depth_loss(pred_depth, gt_depth, **kwargs)
-        if self.normal_loss is not None:
+        if self.normal_loss is not None and gt_normal is not None:
             normal_loss = self.get_normal_loss(pred_normal, gt_normal, **kwargs)
         scales = kwargs["scales"]
         scale_loss = self.get_scale_loss(scales=scales)

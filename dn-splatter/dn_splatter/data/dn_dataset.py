@@ -79,10 +79,10 @@ class GDataset(InputDataset):
 
         # load depths
         if self.load_depths:
-            self.depth_unit_scale_factor = self.metadata["depth_unit_scale_factor"]
-            if "sensor_depth_filenames" in self.metadata:
+            self.sensor_depth_filenames = None
+            if self.metadata.get("sensor_depth_filenames") is not None:
                 self.sensor_depth_filenames = self.metadata["sensor_depth_filenames"]
-            if "depth_filenames" in self.metadata:
+            if self.metadata.get("depth_filenames") is not None:
                 self.sensor_depth_filenames = self.metadata["depth_filenames"]
 
             self.mono_depth_filenames = None
@@ -98,6 +98,13 @@ class GDataset(InputDataset):
                         "[bold yellow] Could not find mono depth filenames in dataparser. Quitting!"
                     )
                     quit()
+
+            # If no depth files found, disable depth loading
+            if self.sensor_depth_filenames is None and self.mono_depth_filenames is None:
+                CONSOLE.print("[bold yellow] No depth data found, disabling depth loading.")
+                self.load_depths = False
+            else:
+                self.depth_unit_scale_factor = self.metadata["depth_unit_scale_factor"]
         # load normals
         if self.load_normals and (
             "normal_filenames" not in dataparser_outputs.metadata.keys()
