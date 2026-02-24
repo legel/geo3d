@@ -85,6 +85,10 @@ class GDataset(InputDataset):
             if self.metadata.get("depth_filenames") is not None:
                 self.sensor_depth_filenames = self.metadata["depth_filenames"]
 
+            self.confidence_filenames = None
+            if self.metadata.get("confidence_filenames") is not None:
+                self.confidence_filenames = self.metadata["confidence_filenames"]
+
             self.mono_depth_filenames = None
             if self.depth_mode in ["mono", "all"]:
                 if (
@@ -138,26 +142,43 @@ class GDataset(InputDataset):
             )
             if self.depth_mode in ["sensor", "all"]:
                 filepath = self.sensor_depth_filenames[data["image_idx"]]
-                depth_image = get_depth_image_from_path(
-                    filepath=filepath,
-                    height=height,
-                    width=width,
-                    scale_factor=scale_factor,
-                )
-                if self.is_euclidean_depth:
-                    fx = self._dataparser_outputs.cameras.fx[data["image_idx"]].item()
-                    fy = self._dataparser_outputs.cameras.fy[data["image_idx"]].item()
-                    cx = int(
-                        self._dataparser_outputs.cameras.cx[data["image_idx"]].item()
+                if filepath is not None:
+                    depth_image = get_depth_image_from_path(
+                        filepath=filepath,
+                        height=height,
+                        width=width,
+                        scale_factor=scale_factor,
                     )
-                    cy = int(
-                        self._dataparser_outputs.cameras.cy[data["image_idx"]].item()
-                    )
-                    depth_image = euclidean_to_z_depth(
-                        depth_image, fx, fy, cx, cy, (width, height), depth_image.device
-                    )
+                    if self.is_euclidean_depth:
+                        fx = self._dataparser_outputs.cameras.fx[data["image_idx"]].item()
+                        fy = self._dataparser_outputs.cameras.fy[data["image_idx"]].item()
+                        cx = int(
+                            self._dataparser_outputs.cameras.cx[data["image_idx"]].item()
+                        )
+                        cy = int(
+                            self._dataparser_outputs.cameras.cy[data["image_idx"]].item()
+                        )
+                        depth_image = euclidean_to_z_depth(
+                            depth_image, fx, fy, cx, cy, (width, height), depth_image.device
+                        )
 
-                depth_data.update({"sensor_depth": depth_image})
+                    # Apply confidence mask if available
+                    if (
+                        hasattr(self, "confidence_filenames")
+                        and self.confidence_filenames is not None
+                    ):
+                        conf_filepath = self.confidence_filenames[data["image_idx"]]
+                        if conf_filepath is not None:
+                            conf_image = get_depth_image_from_path(
+                                filepath=conf_filepath,
+                                height=height,
+                                width=width,
+                                scale_factor=1.0,
+                            )
+                            # Zero out depth where confidence is 0
+                            depth_image[conf_image == 0] = 0.0
+
+                    depth_data.update({"sensor_depth": depth_image})
 
             if self.depth_mode in ["mono", "all"]:
                 assert self.mono_depth_filenames is not None
