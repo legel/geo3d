@@ -23,7 +23,7 @@ from enum import Enum, auto
 from inspect import signature
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp import GradScaler
 
 from nerfstudio.engine.optimizers import Optimizers
 

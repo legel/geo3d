@@ -22,7 +22,8 @@ import torch
 from jaxtyping import Float
 from torch import Tensor
 from torch.autograd import Function
-from torch.amp import custom_bwd, custom_fwd 
+from torch.amp import custom_bwd, custom_fwd
+
 
 class _TruncExp(Function):
     # Implementation from torch-ngp:
@@ -33,10 +34,10 @@ class _TruncExp(Function):
         ctx.save_for_backward(x)
         return torch.exp(x)
 
-
     @staticmethod
     @custom_bwd(device_type='cuda')
-    def backward(ctx, g):
+    def backward(ctx, *grad_outputs):
+        g = grad_outputs[0]
         x = ctx.saved_tensors[0]
         return g * torch.exp(x.clamp(-15, 15))
 
