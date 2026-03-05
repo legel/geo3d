@@ -29,6 +29,7 @@ develop-eggs/
 dist/
 downloads/
 !nerfstudio/scripts/downloads/
+!nerfstudio/nerfstudio/scripts/downloads/
 eggs/
 .eggs/
 lib/
