@@ -30,6 +30,7 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
+from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.spherical_harmonics import num_sh_bases
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
@@ -195,8 +196,7 @@ class DNSplatterModel(SplatfactoModel):
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
-        distances, indices = self.k_nearest_sklearn(means.data, 3)
-        distances = torch.from_numpy(distances)
+        distances, indices = k_nearest_sklearn(means.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
 
@@ -259,9 +259,13 @@ class DNSplatterModel(SplatfactoModel):
         )
 
         if self.config.regularization_strategy == "dn-splatter":
-            self.regularization_strategy = DNRegularization()
+            self.regularization_strategy = DNRegularization(
+                depth_tolerance=self.config.depth_tolerance,
+            )
         elif self.config.regularization_strategy == "ags-mesh":
-            self.regularization_strategy = AGSMeshRegularization()
+            self.regularization_strategy = AGSMeshRegularization(
+                depth_tolerance=self.config.depth_tolerance,
+            )
         else:
             raise NotImplementedError
 
@@ -425,6 +429,95 @@ class DNSplatterModel(SplatfactoModel):
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
+
+    def split_gaussians(self, split_mask, nsamps):
+        """Split gaussians into multiple new gaussians (old API compatibility)."""
+        device = self.device
+        sel = torch.where(split_mask)[0]
+        scales = torch.exp(self.scales[sel])
+        quats = F.normalize(self.quats[sel], p=2, dim=-1)
+        rotmats = quat_to_rotmat(quats)
+        samples = torch.einsum(
+            "nij,nj,bnj->bni",
+            rotmats,
+            scales,
+            torch.randn(nsamps, len(sel), 3, device=device),
+        )
+        new_params = {}
+        for name, param in self.gauss_params.items():
+            repeats = [nsamps] + [1] * (param.dim() - 1)
+            if name == "means":
+                new_params[name] = (param[sel].unsqueeze(0) + samples).reshape(-1, 3)
+            elif name == "scales":
+                new_params[name] = torch.log(scales / 1.6).repeat(nsamps, 1)
+            else:
+                new_params[name] = param[sel].repeat(repeats)
+        return new_params
+
+    def dup_gaussians(self, dup_mask):
+        """Duplicate gaussians (old API compatibility)."""
+        sel = torch.where(dup_mask)[0]
+        new_params = {}
+        for name, param in self.gauss_params.items():
+            new_params[name] = param[sel]
+        return new_params
+
+    def cull_gaussians(self, extra_cull_mask=None):
+        """Cull gaussians based on opacity and scale thresholds."""
+        n_bef = self.num_points
+        # cull transparent ones
+        culls = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
+        # cull huge ones
+        toobigs_count = 0
+        if extra_cull_mask is not None:
+            culls = culls | extra_cull_mask
+        if self.step < self.config.stop_screen_size_at:
+            assert self.max_2Dsize is not None
+            toobigs = (self.max_2Dsize > self.config.cull_scale_thresh).squeeze()
+            culls = culls | toobigs
+            toobigs_count = toobigs.sum().item()
+        for name, param in self.gauss_params.items():
+            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
+        CONSOLE.log(
+            f"Culled {culls.sum().item()} gaussians"
+            f" ({toobigs_count} too big, {culls.sum().item() - toobigs_count} too transparent)"
+            f" {n_bef} -> {self.num_points}"
+        )
+        return culls
+
+    def dup_in_all_optim(self, optimizers, idcs, n):
+        """Duplicate optimizer state for given indices."""
+        param_groups = self.get_gaussian_param_groups()
+        for group, param_list in param_groups.items():
+            optimizer = optimizers.optimizers[group]
+            for p in param_list:
+                if p in optimizer.state:
+                    param_state = optimizer.state[p]
+                    repeats = [n] + [1] * (p.dim() - 1)
+                    for key in param_state:
+                        if key == "step":
+                            continue
+                        param_state[key] = torch.cat(
+                            [param_state[key], torch.zeros_like(param_state[key][idcs].repeat(repeats))],
+                            dim=0,
+                        )
+
+    def remove_from_all_optim(self, optimizers, deleted_mask):
+        """Remove optimizer state for deleted gaussians."""
+        param_groups = self.get_gaussian_param_groups()
+        for group, param_list in param_groups.items():
+            optimizer = optimizers.optimizers[group]
+            for p_old in param_list:
+                if p_old in optimizer.state:
+                    param_state = optimizer.state[p_old]
+                    del optimizer.state[p_old]
+                    p_new = self.gauss_params[group]
+                    for key in param_state:
+                        if key == "step":
+                            continue
+                        param_state[key] = param_state[key][~deleted_mask]
+                    optimizer.param_groups[0]["params"] = [p_new]
+                    optimizer.state[p_new] = param_state
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
@@ -747,13 +840,15 @@ class DNSplatterModel(SplatfactoModel):
             depth_gt = mono_depth_gt
 
         if depth_gt is None and self.config.use_depth_loss:
-            CONSOLE.log(
-                "--pipeline.model.use-depth-loss is set to True but could not find depths to load. Remember to load depths in dataparser.",
-                style="bold yellow",
-            )
+            if not getattr(self, "_depth_warning_shown", False):
+                CONSOLE.log(
+                    "Some images have no depth data (expected for drone images without depth maps).",
+                    style="bold yellow",
+                )
+                self._depth_warning_shown = True
 
         if self.config.regularization_strategy == "dn-splatter":
-            regularization_strategy_loss = self.regularization_strategy(
+            regularization_strategy_loss, reg_loss_dict = self.regularization_strategy(
                 pred_depth=depth_out,
                 gt_depth=depth_gt,
                 pred_normal=pred_normal,
@@ -761,7 +856,7 @@ class DNSplatterModel(SplatfactoModel):
                 **additional_data,
             )
         elif self.config.regularization_strategy == "ags-mesh":
-            regularization_strategy_loss = self.regularization_strategy(
+            regularization_strategy_loss, reg_loss_dict = self.regularization_strategy(
                 step=self.step,
                 pred_depth=depth_out,
                 gt_depth=depth_gt,
@@ -773,6 +868,11 @@ class DNSplatterModel(SplatfactoModel):
             )
 
         main_loss = rgb_loss + regularization_strategy_loss
+
+        # Store individual losses for monitoring (not in loss_dict to avoid double-counting in trainer's sum)
+        self._last_rgb_loss = rgb_loss.detach()
+        self._last_depth_loss = reg_loss_dict["depth_loss"]
+        self._last_normal_loss = reg_loss_dict["normal_loss"]
 
         return {"main_loss": main_loss, "scale_reg": scale_reg}
 

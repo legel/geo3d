@@ -31,7 +31,7 @@ from tqdm import tqdm
 from nerfstudio.utils.io import load_from_json
 from jaxtyping import Float
 
-BATCH_SIZE = 15
+BATCH_SIZE = 100
 CONSOLE = Console(width=120)
 
 image_size = 384  # omnidata can only accept 384x384 images
@@ -82,7 +82,11 @@ class NormalsFromPretrained:
             CONSOLE.print(
                 f"[bold yellow]Found images in /{self.img_dir_name}, using these to generate mononormals."
             )
-            image_paths = get_filename_list(self.data_dir / Path(self.img_dir_name))
+            IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            image_paths = [
+                p for p in get_filename_list(self.data_dir / Path(self.img_dir_name))
+                if p.suffix.lower() in IMAGE_EXTENSIONS
+            ]
             if self.normal_format == "omnidata":
                 if self.resolution == "low":
                     run_monocular_normals(images=image_paths, save_path=self.save_path)
@@ -145,6 +149,20 @@ def run_monocular_dsine(
         )
 
 
+def _load_and_resize_image(args):
+    """Worker function for parallel image loading. Returns (index, resized_tensor, H, W)."""
+    idx, path, target_size = args
+    from PIL import Image as PILImage
+    img = PILImage.open(path).convert("RGB")
+    W_orig, H_orig = img.size
+    img_tensor = torch.from_numpy(np.array(img)).float() / 255.0  # [H, W, 3]
+    if H_orig > target_size or W_orig > target_size:
+        img_tensor = TF.resize(
+            img_tensor.permute(2, 0, 1), (target_size, target_size), antialias=None
+        ).permute(1, 2, 0)
+    return idx, img_tensor, H_orig, W_orig
+
+
 def run_monocular_normals(
     images: List[Path],
     save_path: Path,
@@ -159,6 +177,8 @@ def run_monocular_normals(
     Returns:
         None
     """
+    import concurrent.futures
+
     if save_path is None:
         save_path = images[0].parent.parent / "normals_from_pretrain"
     save_path.mkdir(exist_ok=True, parents=True)
@@ -175,7 +195,7 @@ def run_monocular_normals(
     )
     from omnidata_tools.torch.modules.midas.dpt_depth import DPTDepthModel
     model = DPTDepthModel(backbone="vitb_rn50_384", num_channels=3)  # DPT Hybrid
-    checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location)
+    checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location, weights_only=False)
     if "state_dict" in checkpoint:
         state_dict = {}
         for k, v in checkpoint["state_dict"].items():
@@ -185,39 +205,49 @@ def run_monocular_normals(
 
     model.load_state_dict(state_dict)
     model.to(device)
+    model.eval()
 
     image_list = images
     batch_size = BATCH_SIZE
+    num_workers = min(16, os.cpu_count() or 4)
+
+    # Parallel load all images to CPU, resize to model input, then bulk transfer to GPU
+    CONSOLE.print(f"[bold green]Loading {len(image_list)} images with {num_workers} workers...")
+    load_args = [(i, path, image_size) for i, path in enumerate(image_list)]
+    cpu_images = [None] * len(image_list)
+    orig_sizes = [None] * len(image_list)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_load_and_resize_image, arg): arg[0] for arg in load_args}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(image_list), desc="Loading images"):
+            idx, img_tensor, H, W = future.result()
+            cpu_images[idx] = img_tensor
+            orig_sizes[idx] = (H, W)
+
+    # Stack all and move to GPU in one shot
+    CONSOLE.print(f"[bold green]Transferring all images to GPU...")
+    all_images = torch.stack(cpu_images, dim=0).permute(0, 3, 1, 2).to(device)  # [N, 3, H, W]
+    del cpu_images
+    gpu_mem = torch.cuda.memory_allocated(device) / 1e9
+    CONSOLE.print(f"[bold green]All {len(image_list)} images on GPU. VRAM used: {gpu_mem:.1f} GB")
 
     for batch_index in range(0, len(image_list), batch_size):
+        batch_num = batch_index // batch_size + 1
+        total_batches = (len(image_list) + batch_size - 1) // batch_size
         CONSOLE.print(
-            f"[bold green]Generating normals from imgs for batch {batch_index // batch_size} / {len(image_list)//batch_size}"
+            f"[bold green]Inference batch {batch_num}/{total_batches}"
         )
-        batch_images_path = image_list[batch_index : batch_index + batch_size]
+        batch_end = min(batch_index + batch_size, len(image_list))
+        batch_images_path = image_list[batch_index:batch_end]
+        batch_input = all_images[batch_index:batch_end]
+
         with torch.no_grad():
-            image_tensors = []
-            for path_index in range(len(batch_images_path)):
-                single_path = batch_images_path[path_index]
-                image = image_path_to_tensor(single_path).to(device)
-                H, W = image.shape[:2]
-                if image.shape[0] > image_size or image.shape[1] > image_size:
-                    image = TF.resize(
-                        image.permute(2, 0, 1), (image_size, image_size), antialias=None
-                    ).permute(1, 2, 0)
-                image_tensors.append(image)
+            output = model(batch_input).clamp(min=0, max=1)
 
-            image_tensors = torch.stack(image_tensors, dim=0)
-            image_tensors = image_tensors.permute(0, 3, 1, 2)
-            output = model(image_tensors).clamp(min=0, max=1)
-
-            # save data
+            # save data (low-res: keep at model output size 384x384)
             for path_index in range(len(batch_images_path)):
                 single_path = batch_images_path[path_index]
                 result_i = output[path_index].permute(1, 2, 0)
-                if result_i.shape[:2] != (H, W):
-                    result_i = TF.resize(
-                        result_i.permute(2, 0, 1), (H, W), antialias=None
-                    ).permute(1, 2, 0)
 
                 save_normal(
                     result_i,
@@ -309,7 +339,7 @@ def normals_from_pretrain(
     )
     from omnidata_tools.torch.modules.midas.dpt_depth import DPTDepthModel
     model = DPTDepthModel(backbone="vitb_rn50_384", num_channels=3)  # DPT Hybrid
-    checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location)
+    checkpoint = torch.load(omnidata_pretrained_weights_path, map_location=map_location, weights_only=False)
     if "state_dict" in checkpoint:
         state_dict = {}
         for k, v in checkpoint["state_dict"].items():
