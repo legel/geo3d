@@ -55,7 +55,7 @@ class PosesToColmap:
             "0",
             "--ImageReader.camera_model",
             self.camera,
-            "--SiftExtraction.use_gpu",
+            "--FeatureExtraction.use_gpu",
             str(use_gpu),
         )
         feature_cmd = (" ").join(feature_cmd)

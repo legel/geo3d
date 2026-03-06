@@ -60,7 +60,7 @@ class ConvertColmap:
                 --ImageReader.camera_model "
                 + self.camera
                 + " \
-                --SiftExtraction.use_gpu "
+                --FeatureExtraction.use_gpu "
                 + str(use_gpu)
             )
             exit_code = os.system(feat_extracton_cmd)
@@ -77,7 +77,7 @@ class ConvertColmap:
                 --database_path "
                 + base_dir
                 + "/colmap/database.db \
-                --SiftMatching.use_gpu "
+                --FeatureMatching.use_gpu "
                 + str(use_gpu)
             )
             exit_code = os.system(feat_matching_cmd)
