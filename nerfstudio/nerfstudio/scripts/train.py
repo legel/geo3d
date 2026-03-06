@@ -69,7 +69,8 @@ DEFAULT_TIMEOUT = timedelta(minutes=30)
 
 # speedup for when input size to model doesn't change (much)
 torch.backends.cudnn.benchmark = True  # type: ignore
-
+# use TF32 on Ampere+ GPUs for faster float32 matmuls
+torch.set_float32_matmul_precision("high")
 
 def _find_free_port() -> str:
     """Finds a free port."""
