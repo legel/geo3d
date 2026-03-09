@@ -1109,7 +1109,43 @@ class DNSplatterModel(SplatfactoModel):
             metrics_dict.update(normal_metrics)
             combined_normal = torch.cat([gt_normal, predicted_normal], dim=1)
 
+
+        # Rescale the depth images with clamp for visualization using the 0.2 and 0.8 quantiles
+        quantiles = torch.quantile(
+            combined_depth.flatten(),
+            torch.tensor([0.2, 0.8], device=combined_depth.device, dtype=combined_depth.dtype),
+        )
+        # quantiles shape: (2,) — one scalar per quantile
+        combined_depth = combined_depth.clamp(quantiles[0], quantiles[1])
+        # Rescale to 0 to 1
+        combined_depth = (combined_depth - quantiles[0]) / (quantiles[1] - quantiles[0])
+
+        # Rescale the output images to 0 to 255 and uint8 for visualization
+        def _rescale_and_convert_to_uint8(image):
+            assert image.min() >= 0.0 and image.max() <= 1.0
+            image = (image * 255).to(torch.uint8)
+            return image
+
+
+        # (1/3) RGB
+        assert combined_rgb.min() >= 0.0 and combined_rgb.max() <= 1.0
+        combined_rgb = _rescale_and_convert_to_uint8(combined_rgb)
+
+        # (2/3) Depth
+        combined_depth = _rescale_and_convert_to_uint8(combined_depth)
+
+        # (3/3) Normals
         combined_normal = combined_normal.clamp(0.0, 1.0)
+        combined_normal = _rescale_and_convert_to_uint8(combined_normal)
+
+        # Print the bounds of the output images
+        # print(f"RGB bounds: {combined_rgb.min().item()}, {combined_rgb.max().item()}")
+        # print(f"Depth bounds: {combined_depth.min().item()}, {combined_depth.max().item()}")
+        # print(f"GT Depth bounds: {gt_depth.min().item()}, {gt_depth.max().item()}")
+        # print(f"Predicted Depth bounds: {predicted_depth.min().item()}, {predicted_depth.max().item()}")
+        # print(f"Normal bounds: {combined_normal.min().item()}, {combined_normal.max().item()}")
+        # print(f"GT Normal bounds: {gt_normal.min().item()}, {gt_normal.max().item()}")
+        # print(f"Predicted Normal bounds: {predicted_normal.min().item()}, {predicted_normal.max().item()}")
 
         images_dict = {
             "img": combined_rgb,
