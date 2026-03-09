@@ -714,9 +714,11 @@ class DNSplatterModel(SplatfactoModel):
                 rasterize_mode=self.config.rasterize_mode,
             )
             normals_im = normals_raster.squeeze(0)
-            # convert normals from [-1,1] to [0,1]
-            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
-            normals_im = (normals_im + 1) / 2
+            # Safe normalize (avoid 0/0 -> nan which displays as black)
+            norm = normals_im.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            normals_im = normals_im / norm
+            # convert normals from [-1,1] to [0,1] for visualization
+            normals_im = ((normals_im + 1) / 2).clamp(0.0, 1.0)
 
         if hasattr(camera, "metadata"):
             if camera.metadata is not None and "cam_idx" in camera.metadata:
@@ -874,7 +876,20 @@ class DNSplatterModel(SplatfactoModel):
         self._last_depth_loss = reg_loss_dict["depth_loss"]
         self._last_normal_loss = reg_loss_dict["normal_loss"]
 
-        return {"main_loss": main_loss, "scale_reg": scale_reg}
+        # Log separate losses in wandb (detached so trainer sum does not double-count gradients)
+        def _to_scalar_tensor(x):
+            """Convert loss value (float or tensor) to a detached tensor for logging."""
+            t = torch.as_tensor(x, device=self.device)
+            return t.detach()
+
+        loss_dict = {
+            "main_loss": main_loss,
+            "scale_reg": scale_reg,
+            "rgb_loss": rgb_loss.detach(),
+            "depth_loss": _to_scalar_tensor(reg_loss_dict["depth_loss"]),
+            "normal_loss": _to_scalar_tensor(reg_loss_dict["normal_loss"]),
+        }
+        return loss_dict
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -983,6 +998,7 @@ class DNSplatterModel(SplatfactoModel):
             if outputs["normal"].dim() == 4
             else outputs["normal"]
         )
+        predicted_normal = predicted_normal.clamp(0.0, 1.0)
 
         combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
         combined_depth = (
@@ -1041,6 +1057,34 @@ class DNSplatterModel(SplatfactoModel):
             }
             metrics_dict.update(depth_metrics)
             combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
+        elif "mono_depth" in batch:
+            gt_depth = batch["mono_depth"].to(self.device)
+
+            if predicted_depth.shape[:2] != gt_depth.shape[:2]:
+                predicted_depth = TF.resize(
+                    predicted_depth.permute(2, 0, 1), gt_depth.shape[:2], antialias=None
+                ).permute(1, 2, 0)
+
+            gt_depth = gt_depth.to(torch.float32)
+
+            if "mask" in batch:
+                gt_depth = gt_depth * mask
+                predicted_depth = predicted_depth * mask
+
+            (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
+                predicted_depth.permute(2, 0, 1), gt_depth.permute(2, 0, 1)
+            )
+            depth_metrics = {
+                "depth_abs_rel": float(abs_rel.item()),
+                "depth_sq_rel": float(sq_rel.item()),
+                "depth_rmse": float(rmse.item()),
+                "depth_rmse_log": float(rmse_log.item()),
+                "depth_a1": float(a1.item()),
+                "depth_a2": float(a2.item()),
+                "depth_a3": float(a3.item()),
+            }
+            metrics_dict.update(depth_metrics)
+            combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
 
         if "normal" in batch:
             gt_normal = batch["normal"].to(self.device)
@@ -1064,6 +1108,8 @@ class DNSplatterModel(SplatfactoModel):
             }
             metrics_dict.update(normal_metrics)
             combined_normal = torch.cat([gt_normal, predicted_normal], dim=1)
+
+        combined_normal = combined_normal.clamp(0.0, 1.0)
 
         images_dict = {
             "img": combined_rgb,
