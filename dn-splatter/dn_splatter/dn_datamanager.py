@@ -3,7 +3,6 @@ Datamanager that processes optional depth and normal data.
 """
 
 import random
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Tuple, Type, Union
 
@@ -64,7 +63,7 @@ class DNSplatterDataManager(FullImageDatamanager):
             True
             if ("depth_filenames" in metadata)
             or ("sensor_depth_filenames" in metadata)
-            or ("mono_depth_filenames") in metadata
+            or "mono_depth_filenames" in metadata
             else False
         )
 
@@ -72,19 +71,9 @@ class DNSplatterDataManager(FullImageDatamanager):
         self.load_confidence = metadata.get("load_confidence", False)
         self.image_idx = 0
 
-        # Ground-only warmup: identify ground images (those with sensor depth maps)
-        self.ground_image_indices = None
-        if "is_ground_image" in metadata:
-            self.ground_image_indices = [
-                i for i, g in enumerate(metadata["is_ground_image"]) if g
-            ]
-
-        self._warmup_active = (
-            self.ground_image_indices is not None
-            and len(self.ground_image_indices) > 0
-        )
+        # Log warmup state (already computed lazily in sample_train_cameras during parent init)
+        self._ensure_warmup_state()
         if self._warmup_active:
-            self.train_unseen_cameras = self._sample_ground_cameras()
             CONSOLE.print(
                 f"[bold green]Ground-only warmup active: "
                 f"{len(self.ground_image_indices)}/{len(self.train_dataset)} images"
@@ -106,11 +95,37 @@ class DNSplatterDataManager(FullImageDatamanager):
             scale_factor=self.config.camera_res_scale_factor,
         )
 
+    def _ensure_warmup_state(self) -> None:
+        """Lazily compute ground_image_indices and _warmup_active from metadata.
+        Called from sample_train_cameras() on first use (during parent __init__),
+        so the correct camera list is returned before any training steps.
+        """
+        if hasattr(self, "_warmup_state_initialized") and self._warmup_state_initialized:
+            return
+        metadata = self.train_dataparser_outputs.metadata
+        self.ground_image_indices = None
+        if "is_ground_image" in metadata:
+            self.ground_image_indices = [
+                i for i, g in enumerate(metadata["is_ground_image"]) if g
+            ]
+        self._warmup_active = (
+            self.ground_image_indices is not None
+            and len(self.ground_image_indices) > 0
+        )
+        self._warmup_state_initialized = True
+
     def _sample_ground_cameras(self):
         """Return a shuffled list of ground-only camera indices for warmup phase."""
         indices = list(self.ground_image_indices)
         random.shuffle(indices)
         return indices
+
+    def sample_train_cameras(self):
+        """Override to use ground-only cameras during warmup phase."""
+        self._ensure_warmup_state()
+        if self._warmup_active:
+            return self._sample_ground_cameras()
+        return super().sample_train_cameras()
 
     def activate_full_training(self):
         """Switch from ground-only warmup to full dataset training."""
@@ -121,23 +136,12 @@ class DNSplatterDataManager(FullImageDatamanager):
             "Now training on ALL images (ground + drone) ====="
         )
 
-    def next_train(self, step: int) -> Tuple[Cameras, Dict]:
-        """Returns the next training batch"""
-
-        self.image_idx = self.train_unseen_cameras.pop(0)
-        if len(self.train_unseen_cameras) == 0:
-            if self._warmup_active:
-                self.train_unseen_cameras = self._sample_ground_cameras()
-            else:
-                self.train_unseen_cameras = self.sample_train_cameras()
-        data = deepcopy(self.cached_train[self.image_idx])
-        data["image"] = data["image"].to(self.device)
-
+    def _apply_dn_specific_handling(self, data: Dict) -> None:
+        """Move depth, normal, confidence to device and resize to match image. In-place."""
         if "mask" in data:
             data["mask"] = data["mask"].to(self.device)
             if data["mask"].dim() == 2:
                 data["mask"] = data["mask"][..., None]
-
         if self.load_depths:
             if "sensor_depth" in data:
                 data["sensor_depth"] = data["sensor_depth"].to(self.device)
@@ -155,9 +159,8 @@ class DNSplatterDataManager(FullImageDatamanager):
                         data["image"].shape[:2],
                         antialias=None,
                     ).permute(1, 2, 0)
-
         if self.load_normals:
-            assert "normal" in data
+            assert "normal" in data, "Normal data not found in data"
             data["normal"] = data["normal"].to(self.device)
             if data["normal"].shape != data["image"].shape:
                 data["normal"] = TF.resize(
@@ -174,88 +177,22 @@ class DNSplatterDataManager(FullImageDatamanager):
                     data["image"].shape[:2],
                     antialias=None,
                 ).permute(1, 2, 0)
-        assert (
-            len(self.train_dataset.cameras.shape) == 1
-        ), "Assumes single batch dimension"
-        camera = self.train_dataset.cameras[self.image_idx : self.image_idx + 1].to(
-            self.device
-        )
-        if camera.metadata is None:
-            camera.metadata = {}
-        camera.metadata["cam_idx"] = self.image_idx
+
+    def next_train(self, step: int) -> Tuple[Cameras, Dict]:
+        """Returns the next training batch. Delegates to base, then adds DN-specific handling."""
+        camera, data = super().next_train(step)
+        self.image_idx = camera.metadata.get("cam_idx", 0)
+        self._apply_dn_specific_handling(data)
         return camera, data
 
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
-        """Returns the next evaluation batch
-
-        Returns a Camera instead of raybundle"""
-        image_idx = self.eval_unseen_cameras[
-            random.randint(0, len(self.eval_unseen_cameras) - 1)
-        ]
-
-        # Make sure to re-populate the unseen cameras list if we have exhausted it
-        if len(self.eval_unseen_cameras) == 0:
-            self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
-        data = deepcopy(self.cached_eval[image_idx])
-        data["image"] = data["image"].to(self.device)
-        if "mask" in data:
-            data["mask"] = data["mask"].to(self.device)
-            if data["mask"].dim() == 2:
-                data["mask"] = data["mask"][..., None]
-        if self.load_depths:
-            if "sensor_depth" in data:
-                data["sensor_depth"] = data["sensor_depth"].to(self.device)
-                if data["sensor_depth"].shape != data["image"].shape:
-                    data["sensor_depth"] = TF.resize(
-                        data["sensor_depth"].permute(2, 0, 1),
-                        data["image"].shape[:2],
-                        antialias=None,
-                    ).permute(1, 2, 0)
-            if "mono_depth" in data:
-                data["mono_depth"] = data["mono_depth"].to(self.device)
-                if data["mono_depth"].shape != data["image"].shape:
-                    data["mono_depth"] = TF.resize(
-                        data["mono_depth"].permute(2, 0, 1),
-                        data["image"].shape[:2],
-                        antialias=None,
-                    ).permute(1, 2, 0)
-        if self.load_normals:
-            assert "normal" in data
-            data["normal"] = data["normal"].to(self.device)
-            if data["normal"].shape != data["image"].shape:
-                data["normal"] = TF.resize(
-                    data["normal"].permute(2, 0, 1),
-                    data["image"].shape[:2],
-                    antialias=None,
-                ).permute(1, 2, 0)
-        if self.load_confidence:
-            assert "confidence" in data
-            data["confidence"] = data["confidence"].to(self.device)
-            if data["confidence"].shape != data["image"].shape:
-                data["confidence"] = TF.resize(
-                    data["confidence"].permute(2, 0, 1),
-                    data["image"].shape[:2],
-                    antialias=None,
-                ).permute(1, 2, 0)
-        assert (
-            len(self.eval_dataset.cameras.shape) == 1
-        ), "Assumes single batch dimension"
-        camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
-        if camera.metadata is None:
-            camera.metadata = {}
-        camera.metadata["cam_idx"] = image_idx
+        """Returns the next evaluation batch. Delegates to base, then adds DN-specific handling."""
+        camera, data = super().next_eval(step)
+        self._apply_dn_specific_handling(data)
         return camera, data
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
-        """Returns the next eval image"""
-
-        image_idx = self.eval_unseen_cameras[
-            random.randint(0, len(self.eval_unseen_cameras) - 1)
-        ]
-        data = deepcopy(self.cached_eval[image_idx])
-        data["image"] = data["image"].to(self.device)
-        assert (
-            len(self.eval_dataset.cameras.shape) == 1
-        ), "Assumes single batch dimension"
-        camera = self.eval_dataset.cameras[image_idx : image_idx + 1].to(self.device)
+        """Returns the next eval image. Delegates to base, then adds DN-specific handling."""
+        camera, data = super().next_eval_image(step)
+        self._apply_dn_specific_handling(data)
         return camera, data

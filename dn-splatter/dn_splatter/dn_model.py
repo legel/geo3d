@@ -2,7 +2,6 @@
 Depth + normal splatter
 """
 
-import math
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
@@ -24,14 +23,20 @@ from dn_splatter.regularization_strategy import AGSMeshRegularization, DNRegular
 
 from dn_splatter.utils.camera_utils import get_colored_points_from_depth, project_pix
 from dn_splatter.utils.knn import knn_sk
-from dn_splatter.utils.normal_utils import normal_from_depth_image
+from dn_splatter.utils.normal_utils import (
+    compute_normals_from_scales_quats,
+    init_normals_and_quats_from_seed,
+    init_normals_random,
+    normal_from_depth_image,
+    quat_to_rotmat,
+    render_normals,
+)
 
 try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from nerfstudio.utils.math import k_nearest_sklearn
-from nerfstudio.utils.spherical_harmonics import num_sh_bases
+from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -41,26 +46,9 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 from nerfstudio.engine.optimizers import Optimizers
-from nerfstudio.models.splatfacto import (
-    RGB2SH,
-    SplatfactoModel,
-    SplatfactoModelConfig,
-    get_viewmat,
-)
+from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
-
-
-def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:
-    """Convert quaternions (wxyz convention) to rotation matrices."""
-    quats = F.normalize(quats, p=2, dim=-1)
-    w, x, y, z = torch.unbind(quats, dim=-1)
-    mat = torch.stack([
-        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
-        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
-        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
-    ], dim=-1)
-    return mat.reshape(quats.shape[:-1] + (3, 3))
 
 
 @dataclass
@@ -142,121 +130,59 @@ class DNSplatterModel(SplatfactoModel):
     config: DNSplatterModelConfig
 
     def populate_modules(self):
-        if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
-        else:
-            means = torch.nn.Parameter((torch.rand((500000, 3)) - 0.5) * 10)
-        CONSOLE.log(f"Number of initial seed points {means.shape[0]}")
-        self.xys_grad_norm = None
-        self.max_2Dsize = None
-        dim_sh = num_sh_bases(self.config.sh_degree)
-        num_points = means.shape[0]
+        # Step 1: Delegate to Splatfacto for means, scales, quats, features, opacities, strategy
+        super().populate_modules()
+        CONSOLE.log(f"Number of initial seed points {self.means.shape[0]}")
 
-        if self.seed_points is not None and not self.config.random_init:
-            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
-            if self.config.sh_degree > 0:
-                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
-                shs[:, 1:, 3:] = 0.0
+        # Step 2: Apply 2D gaussian scale init and add normals
+        with torch.no_grad():
+            distances, _ = k_nearest_sklearn(self.means.data, 3)
+            avg_dist = distances.mean(dim=-1, keepdim=True)
+
+            if (
+                self.seed_points is not None
+                and len(self.seed_points) == 3  # type: ignore
+            ):
+                CONSOLE.print(
+                    "[bold yellow]Initialising Gaussian normals from initial seed points"
+                )
+                normals_seed = self.seed_points[-1].float()  # type: ignore
+                normals, quats = init_normals_and_quats_from_seed(normals_seed)
+                self.gauss_params["normals"] = torch.nn.Parameter(normals.detach())
+                self.gauss_params["quats"] = torch.nn.Parameter(quats.detach())
+                # 2D gaussian scale init for seed with normals
+                scales_data = self.gauss_params["scales"].data.clone()
+                scales_data[:, 2] = torch.log((avg_dist / 10)[:, 0])
+                self.gauss_params["scales"] = torch.nn.Parameter(scales_data)
             else:
-                CONSOLE.log("use color only optimization with sigmoid activation")
-                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
-            features_rest = torch.nn.Parameter(shs[:, 1:, :])
-        else:
-            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+                normals = init_normals_random(
+                    self.num_points,
+                    self.gauss_params["scales"].data,
+                    self.gauss_params["quats"].data,
+                )
+                self.gauss_params["normals"] = torch.nn.Parameter(normals.detach())
+                if self.config.two_d_gaussians:
+                    scales_data = self.gauss_params["scales"].data.clone()
+                    scales_data[:, 2] = torch.log((avg_dist / 10)[:, 0])
+                    self.gauss_params["scales"] = torch.nn.Parameter(scales_data)
 
-        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
-
-        self.step = 0
-        self.crop_box: Optional[OrientedBox] = None
-        if self.config.background_color == "random":
-            self.background_color = torch.tensor(
-                [0.1490, 0.1647, 0.2157]
-            )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
-        else:
-            self.background_color = get_color(self.config.background_color)
-
+        # Step 3: DN-specific losses and metrics
+        self.camera_idx = 0
+        self.camera = None
         self.mse_loss = torch.nn.MSELoss()
-
-        # Depth Losses
         if self.config.use_depth_loss:
             self.depth_loss = DepthLoss(self.config.depth_loss_type)
             assert self.config.depth_lambda > 0, "depth_lambda should be > 0"
-
         if self.config.use_depth_smooth_loss:
             if self.config.smooth_loss_type == DepthLossType.EdgeAwareTV:
                 self.smooth_loss = DepthLoss(depth_loss_type=DepthLossType.EdgeAwareTV)
             else:
                 self.smooth_loss = DepthLoss(depth_loss_type=DepthLossType.TV)
-
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0, kernel_size=11)
-        self.lpips = LearnedPerceptualImagePatchSimilarity()
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        if self.config.use_normal_tv_loss:
+            self.tv_loss = TVLoss()
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
-        distances, indices = k_nearest_sklearn(means.data, 3)
-        # find the average of the three nearest neighbors for each point and use that as the scale
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-
-        # init normals if present
-        with torch.no_grad():
-            if (
-                self.seed_points is not None and len(self.seed_points) == 3
-            ):  # type: ignore
-                CONSOLE.print(
-                    "[bold yellow]Initialising Gaussian normals from intial seed points"
-                )
-                self.normals_seed = self.seed_points[-1].float()  # type: ignore
-                self.normals_seed = self.normals_seed / torch.norm(
-                    self.normals_seed, dim=-1, keepdim=True
-                )
-                normals = torch.nn.Parameter(self.normals_seed.detach())
-                scales = torch.log(avg_dist.repeat(1, 3))
-                scales[:, 2] = torch.log((avg_dist / 10)[:, 0])
-                scales = torch.nn.Parameter(scales.detach())
-                quats = torch.zeros(len(self.normals_seed), 4)
-                mat = rotate_vector_to_vector(
-                    torch.tensor(
-                        [0, 0, 1], dtype=torch.float, device=self.normals_seed.device
-                    ).repeat(self.normals_seed.shape[0], 1),
-                    self.normals_seed,
-                )
-                quats = matrix_to_quaternion(mat)
-                quats = torch.nn.Parameter(quats.detach())
-            else:
-                scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
-                quats = torch.nn.Parameter(random_quat_tensor(num_points))
-
-                # init random normals based on the above scales and quats
-                normals = F.one_hot(torch.argmin(scales, dim=-1), num_classes=3).float()
-                rots = quat_to_rotmat(quats)
-                normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
-                normals = F.normalize(normals, dim=1)
-                normals = torch.nn.Parameter(normals.detach())
-
-        self.gauss_params = torch.nn.ParameterDict(
-            {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
-                "normals": normals,
-            }
-        )
-
-        self.camera_idx = 0
-        self.camera = None
-        if self.config.use_normal_tv_loss:
-            self.tv_loss = TVLoss()
-
-        # camera optimizer
-        self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
-        )
 
         if self.config.regularization_strategy == "dn-splatter":
             self.regularization_strategy = DNRegularization(
@@ -284,473 +210,182 @@ class DNSplatterModel(SplatfactoModel):
     def normals(self):
         return self.gauss_params["normals"]
 
-    def step_cb(self, step):
-        self.step = step
+    def step_cb(self, optimizers: Optimizers, step):
+        """Delegate to Splatfacto for step, optimizers, schedulers."""
+        super().step_cb(optimizers, step)
 
-    def after_train(self, step):
-        assert step == self.step
-        if self.step >= self.config.stop_split_at:
-            return
-        with torch.no_grad():
-            visible_mask = (self.radii > 0).flatten()
-            if hasattr(self.xys, 'absgrad') and self.xys.absgrad is not None:
-                grads = self.xys.absgrad[0][visible_mask].norm(dim=-1)
-            elif self.xys.grad is not None:
-                grads = self.xys.grad[0][visible_mask].abs().norm(dim=-1)
-            else:
-                return
-            if self.xys_grad_norm is None:
-                self.xys_grad_norm = torch.zeros(self.num_points, device=self.device)
-                self.vis_counts = torch.ones(self.num_points, device=self.device)
-            assert self.vis_counts is not None
-            self.vis_counts[visible_mask] += 1
-            self.xys_grad_norm[visible_mask] += grads
-            if self.max_2Dsize is None:
-                self.max_2Dsize = torch.zeros(self.num_points, device=self.device)
-            newradii = self.radii.detach()[visible_mask]
-            self.max_2Dsize[visible_mask] = torch.maximum(
-                self.max_2Dsize[visible_mask],
-                newradii / float(max(self.last_size[0], self.last_size[1])),
-            )
+    def step_post_backward(self, step):
+        """Delegate to Splatfacto strategy; optionally run continue_cull_post_densification."""
+        super().step_post_backward(step)
+        # continue_cull_post_densification: cull-only pass after refine_stop_iter (strategy returns early)
+        if (
+            self.step >= self.config.stop_split_at
+            and self.config.continue_cull_post_densification
+        ):
+            from gsplat.strategy.ops import remove
 
-    def refinement_after(self, optimizers: Optimizers, step):
-        assert step == self.step
-        if self.step <= self.config.warmup_length:
-            return
-        with torch.no_grad():
-            # Offset all the opacity reset logic by refine_every so that we don't
-            # save checkpoints right when the opacity is reset (saves every 2k)
-            # then cull
-            # only split/cull if we've seen every image since opacity reset
-            reset_interval = self.config.reset_alpha_every * self.config.refine_every
-            do_densification = (
-                self.step < self.config.stop_split_at
-                and self.step % reset_interval
-                > self.num_train_data + self.config.refine_every
-            )
-            if do_densification:
-                # then we densify
-                assert (
-                    self.xys_grad_norm is not None
-                    and self.vis_counts is not None
-                    and self.max_2Dsize is not None
-                )
-                avg_grad_norm = (
-                    (self.xys_grad_norm / self.vis_counts)
-                    * 0.5
-                    * max(self.last_size[0], self.last_size[1])
-                )
-                high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
-                splits = (
-                    self.scales.exp().max(dim=-1).values
-                    > self.config.densify_size_thresh
-                ).squeeze()
-                if self.step < self.config.stop_screen_size_at:
-                    splits |= (
-                        self.max_2Dsize > self.config.split_screen_size
-                    ).squeeze()
-                splits &= high_grads
-                nsamps = self.config.n_split_samples
-                split_params = self.split_gaussians(splits, nsamps)
-
-                dups = (
-                    self.scales.exp().max(dim=-1).values
-                    <= self.config.densify_size_thresh
-                ).squeeze()
-                dups &= high_grads
-                dup_params = self.dup_gaussians(dups)
-                for name, param in self.gauss_params.items():
-                    self.gauss_params[name] = torch.nn.Parameter(
-                        torch.cat(
-                            [param.detach(), split_params[name], dup_params[name]],
-                            dim=0,
-                        )
-                    )
-                # append zeros to the max_2Dsize tensor
-                self.max_2Dsize = torch.cat(
-                    [
-                        self.max_2Dsize,
-                        torch.zeros_like(split_params["scales"][:, 0]),
-                        torch.zeros_like(dup_params["scales"][:, 0]),
-                    ],
-                    dim=0,
+            is_prune = torch.sigmoid(self.opacities.flatten()) < self.config.cull_alpha_thresh
+            if is_prune.any():
+                remove(
+                    params=self.gauss_params,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    mask=is_prune,
                 )
 
-                split_idcs = torch.where(splits)[0]
-                self.dup_in_all_optim(optimizers, split_idcs, nsamps)
-
-                dup_idcs = torch.where(dups)[0]
-                self.dup_in_all_optim(optimizers, dup_idcs, 1)
-
-                # After a guassian is split into two new gaussians, the original one should also be pruned.
-                splits_mask = torch.cat(
-                    (
-                        splits,
-                        torch.zeros(
-                            nsamps * splits.sum() + dups.sum(),
-                            device=self.device,
-                            dtype=torch.bool,
-                        ),
-                    )
-                )
-
-                deleted_mask = self.cull_gaussians(splits_mask)
-            elif (
-                self.step >= self.config.stop_split_at
-                and self.config.continue_cull_post_densification
-            ):
-                deleted_mask = self.cull_gaussians()
-            else:
-                # if we donot allow culling post refinement, no more gaussians will be pruned.
-                deleted_mask = None
-
-            if deleted_mask is not None:
-                self.remove_from_all_optim(optimizers, deleted_mask)
-
-            if (
-                self.step < self.config.stop_split_at
-                and self.step % reset_interval == self.config.refine_every
-            ):
-                # Reset value is set to be twice of the cull_alpha_thresh
-                reset_value = self.config.cull_alpha_thresh * 2.0
-                self.opacities.data = torch.clamp(
-                    self.opacities.data,
-                    max=torch.logit(
-                        torch.tensor(reset_value, device=self.device)
-                    ).item(),
-                )
-                # reset the exp of optimizer
-                optim = optimizers.optimizers["opacities"]
-                param = optim.param_groups[0]["params"][0]
-                param_state = optim.state[param]
-                param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
-                param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
-
-            self.xys_grad_norm = None
-            self.vis_counts = None
-            self.max_2Dsize = None
-
-    def split_gaussians(self, split_mask, nsamps):
-        """Split gaussians into multiple new gaussians (old API compatibility)."""
-        device = self.device
-        sel = torch.where(split_mask)[0]
-        scales = torch.exp(self.scales[sel])
-        quats = F.normalize(self.quats[sel], p=2, dim=-1)
-        rotmats = quat_to_rotmat(quats)
-        samples = torch.einsum(
-            "nij,nj,bnj->bni",
-            rotmats,
-            scales,
-            torch.randn(nsamps, len(sel), 3, device=device),
-        )
-        new_params = {}
-        for name, param in self.gauss_params.items():
-            repeats = [nsamps] + [1] * (param.dim() - 1)
-            if name == "means":
-                new_params[name] = (param[sel].unsqueeze(0) + samples).reshape(-1, 3)
-            elif name == "scales":
-                new_params[name] = torch.log(scales / 1.6).repeat(nsamps, 1)
-            else:
-                new_params[name] = param[sel].repeat(repeats)
-        return new_params
-
-    def dup_gaussians(self, dup_mask):
-        """Duplicate gaussians (old API compatibility)."""
-        sel = torch.where(dup_mask)[0]
-        new_params = {}
-        for name, param in self.gauss_params.items():
-            new_params[name] = param[sel]
-        return new_params
-
-    def cull_gaussians(self, extra_cull_mask=None):
-        """Cull gaussians based on opacity and scale thresholds."""
-        n_bef = self.num_points
-        # cull transparent ones
-        culls = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
-        # cull huge ones
-        toobigs_count = 0
-        if extra_cull_mask is not None:
-            culls = culls | extra_cull_mask
-        if self.step < self.config.stop_screen_size_at:
-            assert self.max_2Dsize is not None
-            toobigs = (self.max_2Dsize > self.config.cull_scale_thresh).squeeze()
-            culls = culls | toobigs
-            toobigs_count = toobigs.sum().item()
-        for name, param in self.gauss_params.items():
-            self.gauss_params[name] = torch.nn.Parameter(param[~culls])
-        CONSOLE.log(
-            f"Culled {culls.sum().item()} gaussians"
-            f" ({toobigs_count} too big, {culls.sum().item() - toobigs_count} too transparent)"
-            f" {n_bef} -> {self.num_points}"
-        )
-        return culls
-
-    def dup_in_all_optim(self, optimizers, idcs, n):
-        """Duplicate optimizer state for given indices."""
-        param_groups = self.get_gaussian_param_groups()
-        for group, param_list in param_groups.items():
-            optimizer = optimizers.optimizers[group]
-            for p in param_list:
-                if p in optimizer.state:
-                    param_state = optimizer.state[p]
-                    repeats = [n] + [1] * (p.dim() - 1)
-                    for key in param_state:
-                        if key == "step":
-                            continue
-                        param_state[key] = torch.cat(
-                            [param_state[key], torch.zeros_like(param_state[key][idcs].repeat(repeats))],
-                            dim=0,
-                        )
-
-    def remove_from_all_optim(self, optimizers, deleted_mask):
-        """Remove optimizer state for deleted gaussians."""
-        param_groups = self.get_gaussian_param_groups()
-        for group, param_list in param_groups.items():
-            optimizer = optimizers.optimizers[group]
-            for p_old in param_list:
-                if p_old in optimizer.state:
-                    param_state = optimizer.state[p_old]
-                    del optimizer.state[p_old]
-                    p_new = self.gauss_params[group]
-                    for key in param_state:
-                        if key == "step":
-                            continue
-                        param_state[key] = param_state[key][~deleted_mask]
-                    optimizer.param_groups[0]["params"] = [p_new]
-                    optimizer.state[p_new] = param_state
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        """Use Splatfacto callbacks (step_cb, step_post_backward)."""
+        return super().get_training_callbacks(training_callback_attributes)
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
-        # Here we explicitly use the means, scales as parameters so that the user can override this function and
-        # specify more if they want to add more optimizable params to gaussians.
-        return {
-            name: [self.gauss_params[name]]
-            for name in [
-                "means",
-                "scales",
-                "quats",
-                "features_dc",
-                "features_rest",
-                "opacities",
-                "normals",
-            ]
-        }
+        """Extend Splatfacto's param groups with normals for DN-Splatter."""
+        groups = super().get_gaussian_param_groups()
+        groups["normals"] = [self.gauss_params["normals"]]
+        return groups
+
+    def load_state_dict(self, state_dict, **kwargs):  # type: ignore
+        """Load state dict with normals handling for legacy checkpoints."""
+        if "means" in state_dict:
+            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                if p in state_dict:
+                    state_dict[f"gauss_params.{p}"] = state_dict[p]
+            if "normals" in state_dict:
+                state_dict["gauss_params.normals"] = state_dict["normals"]
+            elif "gauss_params.normals" not in state_dict:
+                scales = state_dict.get("gauss_params.scales", state_dict.get("scales"))
+                quats = state_dict.get("gauss_params.quats", state_dict.get("quats"))
+                if scales is not None and quats is not None:
+                    newp = state_dict["gauss_params.means"].shape[0]
+                    scales = scales.to(device=self.device)
+                    quats = quats.to(device=self.device)
+                    normals_init = init_normals_random(newp, scales, quats)
+                    state_dict["gauss_params.normals"] = normals_init
+        super().load_state_dict(state_dict, **kwargs)
 
     def get_outputs(
         self, camera: Cameras
     ) -> Dict[str, Union[torch.Tensor, List[Tensor]]]:
-        """Takes in a Ray Bundle and returns a dictionary of outputs.
-
-        Args:
-            ray_bundle: Input bundle of rays. This raybundle should have all the
-            needed information to compute the outputs.
-
-        Returns:
-            Outputs of model. (ie. rendered colors)
-        """
+        """Takes in a camera and returns outputs. Delegates to Splatfacto, adds normals + surface_normal."""
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
 
-        if self.training:
-            assert camera.shape[0] == 1, "Only one camera at a time"
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds
-
-        # binary opacities
+        # Step 1: DN-specific - binary opacities (modifies self.opacities in-place before render)
         if self.config.use_binary_opacities and self.step > self.config.warmup_length:
             skip_steps = self.config.reset_alpha_every * self.config.refine_every
             margin = 200
             if not self.step % skip_steps == 0 and self.step % skip_steps not in range(
                 1, margin + 1
             ):
-                self.opacities = torch.where(
+                self.opacities.data = torch.where(
                     self.opacities >= self.config.binary_opacities_threshold,
                     torch.ones_like(self.opacities),
                     torch.zeros_like(self.opacities),
-                )
+                ).data
 
-        # cropping
-        if self.crop_box is not None and not self.training:
-            crop_ids = self.crop_box.within(self.means).squeeze()
-            if crop_ids.sum() == 0:
-                return self.get_empty_outputs(
-                    int(camera.width.item()),
-                    int(camera.height.item()),
-                    self.background_color,
-                )
-        else:
-            crop_ids = None
+        # Step 2: Delegate to Splatfacto for RGB + depth rasterization (uses splatfacto API)
+        outputs = super().get_outputs(camera)
 
-        if crop_ids is not None:
-            opacities_crop = self.opacities[crop_ids]
-            means_crop = self.means[crop_ids]
-            features_dc_crop = self.features_dc[crop_ids]
-            features_rest_crop = self.features_rest[crop_ids]
-            scales_crop = self.scales[crop_ids]
-            quats_crop = self.quats[crop_ids]
-        else:
-            opacities_crop = self.opacities
-            means_crop = self.means
-            features_dc_crop = self.features_dc
-            features_rest_crop = self.features_rest
-            scales_crop = self.scales
-            quats_crop = self.quats
-
-        colors_crop = torch.cat(
-            (features_dc_crop[:, None, :], features_rest_crop), dim=1
-        )
-
-        BLOCK_WIDTH = (
-            16  # this controls the tile size of rasterization, 16 is a good default
-        )
-        camera_scale_fac = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_scale_fac)
-        viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().cuda()
-        W, H = int(camera.width.item()), int(camera.height.item())
-        self.last_size = (H, W)
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
-
-        # apply the compensation of screen space blurring to gaussians
-        if self.config.rasterize_mode not in ["antialiased", "classic"]:
-            raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
-
-        render_mode = "RGB+ED"
-
-        if self.config.sh_degree > 0:
-            sh_degree_to_use = min(
-                self.step // self.config.sh_degree_interval, self.config.sh_degree
-            )
-        else:
-            colors_crop = torch.sigmoid(colors_crop)
-            sh_degree_to_use = None
-
-        render, alpha, info = rasterization(
-            means=means_crop,
-            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-            colors=colors_crop,
-            viewmats=viewmat,  # [1, 4, 4]
-            Ks=K,  # [1, 3, 3]
-            width=W,
-            height=H,
-            tile_size=BLOCK_WIDTH,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
-            absgrad=True,
-            rasterize_mode=self.config.rasterize_mode,
-            # set some threshold to disregrad small gaussians for faster rendering.
-            # radius_clip=3.0,
-        )
-        if self.training and info["means2d"].requires_grad:
-            info["means2d"].retain_grad()
-        self.xys = info["means2d"]  # [1, N, 2]
-        self.radii = info["radii"][0]  # [N]
-        alpha = alpha[:, ...]
-        self.depths = info["depths"]
-        self.conics = info["conics"]
-        self.num_tiles_hit = info["tiles_per_gauss"]
-
-        background = self._get_background_color()
-        rgb = render[:, ..., :3] + (1 - alpha) * background
-        rgb = torch.clamp(rgb, 0.0, 1.0)
-
-        # visible gaussians
-        self.vis_indices = torch.where(self.radii > 0)[0]
-
-        if render_mode == "RGB+ED":
-            depth_im = render[:, ..., 3:4]
-            depth_im = torch.where(
-                alpha > 0, depth_im, depth_im.detach().max()
-            ).squeeze(0)
-        else:
-            depth_im = None
-
-        normals_im = torch.full(rgb.shape, 0.0)
+        # Step 3: DN-specific - add normals rendering (second rasterization pass)
         if self.config.predict_normals:
-            quats_crop = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
-            normals = F.one_hot(
-                torch.argmin(scales_crop, dim=-1), num_classes=3
-            ).float()
-            rots = quat_to_rotmat(quats_crop)
-            normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
-            normals = F.normalize(normals, dim=1)
-            viewdirs = (
-                -means_crop.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
+            crop_ids = (
+                self.crop_box.within(self.means).squeeze()
+                if self.crop_box is not None and not self.training
+                else None
             )
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            dots = (normals * viewdirs).sum(-1)
-            negative_dot_indices = dots < 0
-            normals[negative_dot_indices] = -normals[negative_dot_indices]
-            # update parameter group normals
-            self.gauss_params["normals"] = normals
-            # convert normals from world space to camera space
-            normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
+            if crop_ids is not None and crop_ids.sum() == 0:
+                normals_im = outputs["rgb"].new_zeros(*outputs["rgb"].shape)
+            else:
+                if crop_ids is not None:
+                    means_crop = self.means[crop_ids]
+                    quats_crop = self.quats[crop_ids]
+                    scales_crop = self.scales[crop_ids]
+                    opacities_crop = torch.sigmoid(self.opacities[crop_ids]).squeeze(-1)
+                else:
+                    means_crop = self.means
+                    quats_crop = self.quats
+                    scales_crop = self.scales
+                    opacities_crop = torch.sigmoid(self.opacities).squeeze(-1)
 
-            normals_raster, _, _ = rasterization(
-                means=means_crop,
-                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-                scales=torch.exp(scales_crop),
-                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-                colors=normals,
-                viewmats=viewmat,
-                Ks=K,
-                width=W,
-                height=H,
-                tile_size=BLOCK_WIDTH,
-                packed=False,
-                near_plane=0.01,
-                far_plane=1e10,
-                render_mode="RGB",
-                sh_degree=None,
-                sparse_grad=False,
-                absgrad=False,
-                rasterize_mode=self.config.rasterize_mode,
-            )
-            normals_im = normals_raster.squeeze(0)
-            # convert normals from [-1,1] to [0,1]
-            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
-            normals_im = (normals_im + 1) / 2
+                if self.training:
+                    optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
+                else:
+                    optimized_c2w = camera.camera_to_worlds
 
-        if hasattr(camera, "metadata"):
-            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                camera_scale_fac = self._get_downscale_factor()
+                camera.rescale_output_resolution(1 / camera_scale_fac)
+                viewmat = get_viewmat(optimized_c2w)
+                K = camera.get_intrinsics_matrices().cuda()
+                W, H = int(camera.width.item()), int(camera.height.item())
+                camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+                normals_im = render_normals(
+                    means=means_crop,
+                    quats=quats_crop,
+                    scales=scales_crop,
+                    opacities=opacities_crop,
+                    viewmat=viewmat,
+                    K=K,
+                    width=W,
+                    height=H,
+                    camera_c2w=optimized_c2w,
+                    rasterize_mode=self.config.rasterize_mode,
+                )
+                # Sync normals param from scales/quats (geometry-derived)
+                quats_norm = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
+                normals_sync = compute_normals_from_scales_quats(
+                    scales_crop, quats_norm, quat_to_rotmat
+                )
+                viewdirs = (-means_crop.detach() + optimized_c2w[..., :3, 3]).detach()
+                viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+                dots = (normals_sync * viewdirs).sum(-1)
+                normals_sync = normals_sync.clone()
+                normals_sync[dots < 0] = -normals_sync[dots < 0]
+                if crop_ids is not None:
+                    full_normals = self.gauss_params["normals"].data.clone()
+                    full_normals[crop_ids] = normals_sync.detach()
+                    self.gauss_params["normals"] = torch.nn.Parameter(full_normals)
+                else:
+                    self.gauss_params["normals"] = torch.nn.Parameter(normals_sync.detach())
+
+            outputs["normal"] = normals_im
+
+        # Step 4: DN-specific - surface normal from depth for visualization/loss
+        depth_im = outputs.get("depth")
+        if depth_im is not None:
+            self.camera = camera
+            if hasattr(camera, "metadata") and camera.metadata and "cam_idx" in camera.metadata:
                 self.camera_idx = camera.metadata["cam_idx"]  # type: ignore
-        self.camera = camera
+            c2w = camera.camera_to_worlds.squeeze(0).detach()
+            c2w = c2w @ torch.diag(
+                torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
+            )
+            surface_normal = normal_from_depth_image(
+                depths=depth_im.detach(),
+                fx=camera.fx.item(),
+                fy=camera.fy.item(),
+                cx=camera.cx.item(),
+                cy=camera.cy.item(),
+                img_size=(camera.width.item(), camera.height.item()),
+                c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
+                device=self.device,
+                smooth=False,
+            )
+            surface_normal = surface_normal @ torch.diag(
+                torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
+            )
+            outputs["surface_normal"] = (1 + surface_normal) / 2
+        else:
+            outputs["surface_normal"] = outputs["rgb"].new_zeros(
+                *outputs["rgb"].shape[:2], 3
+            )
 
-        c2w = self.camera.camera_to_worlds.squeeze(0).detach()
-        c2w = c2w @ torch.diag(
-            torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
-        )
-        surface_normal = normal_from_depth_image(
-            depths=depth_im.detach(),
-            fx=self.camera.fx.item(),
-            fy=self.camera.fy.item(),
-            cx=self.camera.cx.item(),
-            cy=self.camera.cy.item(),
-            img_size=(self.camera.width.item(), self.camera.height.item()),
-            c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
-            device=self.device,
-            smooth=False,
-        )
-        surface_normal = surface_normal @ torch.diag(
-            torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
-        )
-        surface_normal = (1 + surface_normal) / 2
+        if not self.config.predict_normals:
+            outputs["normal"] = outputs["rgb"].new_zeros(*outputs["rgb"].shape)
 
-        return {
-            "rgb": rgb.squeeze(0),
-            "depth": depth_im,
-            "normal": normals_im,  # predicted normal from gaussians
-            "surface_normal": surface_normal,  # normal from surface / depth
-            "accumulation": alpha.squeeze(0),
-            "background": background,
-        }
+        return outputs
 
     def get_loss_dict(
         self, outputs, batch, metrics_dict=None
@@ -768,10 +403,10 @@ class DNSplatterModel(SplatfactoModel):
         main_loss = loss_dict["main_loss"]
         scale_reg = loss_dict["scale_reg"]
 
-        gt_img = self.get_gt_img(batch["image"])
-
-        # minimum to reasonable level
-        gt_img = self.get_gt_img(batch["image"]).clamp(min=10 / 255.0)
+        gt_img = self.composite_with_background(
+            self.get_gt_img(batch["image"]), outputs["background"]
+        )
+        gt_img = gt_img.clamp(min=10 / 255.0)
         pred_img = outputs["rgb"]
         depth_out = outputs["depth"]
 
@@ -874,84 +509,79 @@ class DNSplatterModel(SplatfactoModel):
         self._last_depth_loss = reg_loss_dict["depth_loss"]
         self._last_normal_loss = reg_loss_dict["normal_loss"]
 
-        return {"main_loss": main_loss, "scale_reg": scale_reg}
+        # Log separate losses in wandb (detached so trainer sum does not double-count gradients)
+        def _to_scalar_tensor(x):
+            """Convert loss value (float or tensor) to a detached tensor for logging."""
+            t = torch.as_tensor(x, device=self.device)
+            return t.detach()
+
+        loss_dict = {
+            "main_loss": main_loss,
+            "scale_reg": scale_reg,
+            "rgb_loss": rgb_loss.detach(),
+            "depth_loss": _to_scalar_tensor(reg_loss_dict["depth_loss"]),
+            "normal_loss": _to_scalar_tensor(reg_loss_dict["normal_loss"]),
+        }
+        return loss_dict
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
-        """Compute and returns metrics.
+        """Compute and returns metrics. Delegates to Splatfacto, adds DN-specific metrics."""
+        metrics_dict = super().get_metrics_dict(outputs, batch)
+        # Add rgb_* aliases for DN logging compatibility
+        if "psnr" in metrics_dict:
+            metrics_dict["rgb_psnr"] = metrics_dict["psnr"]
+        if "ssim" in metrics_dict:
+            metrics_dict["rgb_ssim"] = metrics_dict["ssim"]
+        if "lpips" in metrics_dict:
+            metrics_dict["rgb_lpips"] = metrics_dict["lpips"]
 
-        Args:
-            outputs: the output to compute loss dict to
-            batch: ground truth batch corresponding to outputs
-        """
-        d = self._get_downscale_factor()
-        if d > 1:
-            # use torchvision to resize
-            newsize = (batch["image"].shape[0] // d, batch["image"].shape[1] // d)
-            gt_img = TF.resize(
-                batch["image"].permute(2, 0, 1), newsize, antialias=None
-            ).permute(1, 2, 0)
-
-            if "sensor_depth" in batch:
-                depth_size = (
-                    batch["sensor_depth"].shape[0] // d,
-                    batch["sensor_depth"].shape[1] // d,
-                )
-                sensor_depth_gt = TF.resize(
-                    batch["sensor_depth"].permute(2, 0, 1), depth_size, antialias=None
-                ).permute(1, 2, 0)
-        else:
-            gt_img = batch["image"]
-            if "sensor_depth" in batch:
-                sensor_depth_gt = batch["sensor_depth"]
-
-        metrics_dict = {}
-        gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
         predicted_rgb = (
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
-
-        # comment out for now, as it will slow down the training speed.
-        (psnr, ssim, lpips) = self.rgb_metrics(
-            gt_rgb.permute(2, 0, 1).unsqueeze(0),
-            predicted_rgb.permute(2, 0, 1).unsqueeze(0).to(self.device),
+        gt_img = self.composite_with_background(
+            self.get_gt_img(batch["image"]), outputs["background"]
         )
-        rgb_mse = self.mse_loss(gt_rgb.permute(2, 0, 1), predicted_rgb.permute(2, 0, 1))
-        metrics_dict = {
-            "rgb_mse": float(rgb_mse),
-            "rgb_psnr": float(psnr.item()),
-            "rgb_ssim": float(ssim),
-            "rgb_lpips": float(lpips),
-        }
-
-        metrics_dict["gaussian_count"] = self.num_points
+        metrics_dict["rgb_mse"] = float(
+            self.mse_loss(
+                gt_img.permute(2, 0, 1).to(self.device),
+                predicted_rgb.permute(2, 0, 1),
+            ).item()
+        )
 
         if self.config.use_depth_loss and "sensor_depth" in batch:
+            d = self._get_downscale_factor()
+            sensor_depth_gt = (
+                TF.resize(
+                    batch["sensor_depth"].permute(2, 0, 1),
+                    (batch["sensor_depth"].shape[0] // d, batch["sensor_depth"].shape[1] // d),
+                    antialias=None,
+                ).permute(1, 2, 0)
+                if d > 1
+                else batch["sensor_depth"]
+            )
             predicted_depth = (
                 outputs["depth"][0, ...]
-                if outputs["depth"].dim() == 4
+                if outputs["depth"] is not None and outputs["depth"].dim() == 4
                 else outputs["depth"]
             )
-            predicted_depth = outputs["depth"]
-            (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
-                predicted_depth.permute(2, 0, 1), sensor_depth_gt.permute(2, 0, 1)
-            )
+            if predicted_depth is not None:
+                (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
+                    predicted_depth.permute(2, 0, 1),
+                    sensor_depth_gt.permute(2, 0, 1).to(self.device),
+                )
+                metrics_dict.update({
+                    "depth_abs_rel": float(abs_rel.item()),
+                    "depth_sq_rel": float(sq_rel.item()),
+                    "depth_rmse": float(rmse.item()),
+                    "depth_rmse_log": float(rmse_log.item()),
+                    "depth_a1": float(a1.item()),
+                    "depth_a2": float(a2.item()),
+                    "depth_a3": float(a3.item()),
+                })
 
-            depth_metrics = {
-                "depth_abs_rel": float(abs_rel.item()),
-                "depth_sq_rel": float(sq_rel.item()),
-                "depth_rmse": float(rmse.item()),
-                "depth_rmse_log": float(rmse_log.item()),
-                "depth_a1": float(a1.item()),
-                "depth_a2": float(a2.item()),
-                "depth_a3": float(a3.item()),
-            }
-            metrics_dict.update(depth_metrics)
-
-        # track scales
-        metrics_dict.update(
-            {"avg_min_scale": torch.nanmean(torch.exp(self.scales[..., -1]))}
-        )
-
+        metrics_dict["avg_min_scale"] = torch.nanmean(
+            torch.exp(self.scales[..., -1])
+        ).item()
         return metrics_dict
 
     def get_image_metrics_and_images(
@@ -969,68 +599,62 @@ class DNSplatterModel(SplatfactoModel):
             A dictionary of metrics.
         """
 
-        gt_rgb = batch["image"].to(self.device)
+        metrics_dict, images_dict = super().get_image_metrics_and_images(
+            outputs, batch
+        )
+        # Add rgb_* aliases for DN logging
+        if "psnr" in metrics_dict:
+            metrics_dict["rgb_psnr"] = metrics_dict["psnr"]
+        if "ssim" in metrics_dict:
+            metrics_dict["rgb_ssim"] = metrics_dict["ssim"]
+        if "lpips" in metrics_dict:
+            metrics_dict["rgb_lpips"] = metrics_dict["lpips"]
+
         predicted_rgb = (
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
         predicted_depth = (
             outputs["depth"][0, ...]
-            if outputs["depth"].dim() == 4
-            else outputs["depth"]
+            if outputs.get("depth") is not None and outputs["depth"].dim() == 4
+            else outputs.get("depth")
         )
         predicted_normal = (
             outputs["normal"][0, ...]
-            if outputs["normal"].dim() == 4
-            else outputs["normal"]
+            if outputs.get("normal") is not None and outputs["normal"].dim() == 4
+            else outputs.get("normal", predicted_rgb.new_zeros(*predicted_rgb.shape[:2], 3))
         )
-
-        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+        predicted_normal = predicted_normal.clamp(0.0, 1.0)
         combined_depth = (
-            predicted_depth  # a placeholder if no sensor depth is available
+            predicted_depth
+            if predicted_depth is not None
+            else predicted_rgb.new_zeros(*predicted_rgb.shape[:2], 1)
         )
-        combined_normal = predicted_normal  # a placeholder if no gt normal is available
+        combined_normal = predicted_normal
 
-        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
-        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
-
-        if "mask" in batch:
-            mask = batch["mask"].to(self.device)
-            gt_rgb = gt_rgb * mask
-            predicted_rgb = predicted_rgb * mask
-
-        psnr = self.psnr(gt_rgb, predicted_rgb)
-        ssim = self.ssim(gt_rgb, predicted_rgb)
-        lpips = self.lpips(gt_rgb, predicted_rgb)
-
-        # all of these metrics will be logged as scalars
-        metrics_dict = {
-            "rgb_psnr": float(psnr.item()),
-            "rgb_ssim": float(ssim),
-        }  # type: ignore
-        metrics_dict["rgb_lpips"] = float(lpips)
-
-        predicted_depth = outputs["depth"]
+        gt_depth = None
         if "sensor_depth" in batch:
             gt_depth = batch["sensor_depth"].to(self.device)
+        elif "mono_depth" in batch:
+            gt_depth = batch["mono_depth"].to(self.device)
 
+        if predicted_depth is not None and gt_depth is not None:
+            mask = batch.get("mask")
+            if mask is not None:
+                mask = mask.to(self.device)
             if predicted_depth.shape[:2] != gt_depth.shape[:2]:
                 predicted_depth = TF.resize(
-                    predicted_depth.permute(2, 0, 1), gt_depth.shape[:2], antialias=None
+                    predicted_depth.permute(2, 0, 1),
+                    gt_depth.shape[:2],
+                    antialias=None,
                 ).permute(1, 2, 0)
-
-            gt_depth = gt_depth.to(torch.float32)  # it is in float64 previous
-
-            if "mask" in batch:
+            gt_depth = gt_depth.to(torch.float32)
+            if mask is not None:
                 gt_depth = gt_depth * mask
                 predicted_depth = predicted_depth * mask
-
-            # add depth eval metrics
-
             (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
                 predicted_depth.permute(2, 0, 1), gt_depth.permute(2, 0, 1)
             )
-            depth_metrics = {
+            metrics_dict.update({
                 "depth_abs_rel": float(abs_rel.item()),
                 "depth_sq_rel": float(sq_rel.item()),
                 "depth_rmse": float(rmse.item()),
@@ -1038,8 +662,7 @@ class DNSplatterModel(SplatfactoModel):
                 "depth_a1": float(a1.item()),
                 "depth_a2": float(a2.item()),
                 "depth_a3": float(a3.item()),
-            }
-            metrics_dict.update(depth_metrics)
+            })
             combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
 
         if "normal" in batch:
@@ -1065,39 +688,23 @@ class DNSplatterModel(SplatfactoModel):
             metrics_dict.update(normal_metrics)
             combined_normal = torch.cat([gt_normal, predicted_normal], dim=1)
 
-        images_dict = {
-            "img": combined_rgb,
-            "depth": combined_depth,
-            "normal": combined_normal,
-        }
 
+        # Rescale depth for visualization (quantile clamp)
+        combined_depth_f = combined_depth.float()
+        quantiles = torch.quantile(
+            combined_depth_f.flatten(),
+            torch.tensor([0.2, 0.8], device=combined_depth.device, dtype=torch.float32),
+        )
+        combined_depth = (
+            (combined_depth_f.clamp(quantiles[0], quantiles[1]) - quantiles[0])
+            / (quantiles[1] - quantiles[0] + 1e-8)
+        )
+        combined_depth = (combined_depth * 255).to(torch.uint8)
+        combined_normal = (combined_normal.clamp(0.0, 1.0) * 255).to(torch.uint8)
+
+        images_dict["depth"] = combined_depth
+        images_dict["normal"] = combined_normal
         return metrics_dict, images_dict
-
-    def get_training_callbacks(
-        self, training_callback_attributes: TrainingCallbackAttributes
-    ) -> List[TrainingCallback]:
-        cbs = []
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
-            )
-        )
-        # The order of these matters
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.refinement_after,
-                update_every_num_iters=self.config.refine_every,
-                args=[training_callback_attributes.optimizers],
-            )
-        )
-
-        return cbs
 
     def sample_points_in_gaussians(
         self,
@@ -1640,112 +1247,6 @@ class DNSplatterModel(SplatfactoModel):
         # normal is the negative of the grad
         density_grad = -torch.nn.functional.normalize(density_grad, dim=-1)
         return density_grad
-
-
-def random_quat_tensor(N, **kwargs):
-    u = torch.rand(N, **kwargs)
-    v = torch.rand(N, **kwargs)
-    w = torch.rand(N, **kwargs)
-    return torch.stack(
-        [
-            torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
-            torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
-            torch.sqrt(u) * torch.sin(2 * math.pi * w),
-            torch.sqrt(u) * torch.cos(2 * math.pi * w),
-        ],
-        dim=-1,
-    )
-
-
-def SH2RGB(sh):
-    """
-    Converts from the 0th spherical harmonic coefficient to RGB values [0,1]
-    """
-    C0 = 0.28209479177387814
-    return sh * C0 + 0.5
-
-
-def rotate_vector_to_vector(v1: Tensor, v2: Tensor):
-    """
-    Returns a rotation matrix that rotates v1 to align with v2.
-    """
-    assert v1.dim() == v2.dim()
-    assert v1.shape[-1] == 3
-    if v1.dim() == 1:
-        v1 = v1[None, ...]
-        v2 = v2[None, ...]
-    N = v1.shape[0]
-
-    u = v1 / torch.norm(v1, dim=-1, keepdim=True)
-    Ru = v2 / torch.norm(v2, dim=-1, keepdim=True)
-    I = torch.eye(3, 3, device=v1.device).unsqueeze(0).repeat(N, 1, 1)
-
-    # the cos angle between the vectors
-    c = torch.bmm(u.view(N, 1, 3), Ru.view(N, 3, 1)).squeeze(-1)
-
-    eps = 1.0e-10
-    # the cross product matrix of a vector to rotate around
-    K = torch.bmm(Ru.unsqueeze(2), u.unsqueeze(1)) - torch.bmm(
-        u.unsqueeze(2), Ru.unsqueeze(1)
-    )
-    # Rodrigues' formula
-    ans = I + K + (K @ K) / (1 + c)[..., None]
-    same_direction_mask = torch.abs(c - 1.0) < eps
-    same_direction_mask = same_direction_mask.squeeze(-1)
-    opposite_direction_mask = torch.abs(c + 1.0) < eps
-    opposite_direction_mask = opposite_direction_mask.squeeze(-1)
-    ans[same_direction_mask] = torch.eye(3, device=v1.device)
-    ans[opposite_direction_mask] = -torch.eye(3, device=v1.device)
-    return ans
-
-
-def matrix_to_quaternion(rotation_matrix: Tensor):
-    """
-    Convert a 3x3 rotation matrix to a unit quaternion.
-    """
-    if rotation_matrix.dim() == 2:
-        rotation_matrix = rotation_matrix[None, ...]
-    assert rotation_matrix.shape[1:] == (3, 3)
-
-    traces = torch.vmap(torch.trace)(rotation_matrix)
-    quaternion = torch.zeros(
-        rotation_matrix.shape[0],
-        4,
-        dtype=rotation_matrix.dtype,
-        device=rotation_matrix.device,
-    )
-    for i in range(rotation_matrix.shape[0]):
-        matrix = rotation_matrix[i]
-        trace = traces[i]
-        if trace > 0:
-            S = torch.sqrt(trace + 1.0) * 2
-            w = 0.25 * S
-            x = (matrix[2, 1] - matrix[1, 2]) / S
-            y = (matrix[0, 2] - matrix[2, 0]) / S
-            z = (matrix[1, 0] - matrix[0, 1]) / S
-        elif (matrix[0, 0] > matrix[1, 1]) and (matrix[0, 0] > matrix[2, 2]):
-            S = torch.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2
-            w = (matrix[2, 1] - matrix[1, 2]) / S
-            x = 0.25 * S
-            y = (matrix[0, 1] + matrix[1, 0]) / S
-            z = (matrix[0, 2] + matrix[2, 0]) / S
-        elif matrix[1, 1] > matrix[2, 2]:
-            S = torch.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2
-            w = (matrix[0, 2] - matrix[2, 0]) / S
-            x = (matrix[0, 1] + matrix[1, 0]) / S
-            y = 0.25 * S
-            z = (matrix[1, 2] + matrix[2, 1]) / S
-        else:
-            S = torch.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2
-            w = (matrix[1, 0] - matrix[0, 1]) / S
-            x = (matrix[0, 2] + matrix[2, 0]) / S
-            y = (matrix[1, 2] + matrix[2, 1]) / S
-            z = 0.25 * S
-
-        quaternion[i] = torch.tensor(
-            [w, x, y, z], dtype=matrix.dtype, device=matrix.device
-        )
-    return quaternion
 
 
 def scale_rot_to_inv_cov3d(scale, quat, return_sqrt=False):

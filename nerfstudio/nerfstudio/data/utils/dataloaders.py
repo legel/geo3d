@@ -107,7 +107,7 @@ def _undistort_image(
         # crop the image and update the intrinsics accordingly
         x, y, w, h = roi
         image = image[y : y + h, x : x + w]
-
+        
         newK[0, 2] -= x
         newK[1, 2] -= y
 

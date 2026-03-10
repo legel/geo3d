@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Type
 
 import torch
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parameter import Parameter
 
 from nerfstudio.configs import base_config

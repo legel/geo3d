@@ -31,7 +31,7 @@ from tqdm import tqdm
 from nerfstudio.utils.io import load_from_json
 from jaxtyping import Float
 
-BATCH_SIZE = 100
+BATCH_SIZE = 50
 CONSOLE = Console(width=120)
 
 image_size = 384  # omnidata can only accept 384x384 images
@@ -55,6 +55,8 @@ class NormalsFromPretrained:
     force_images_dir: bool = False
     """Force to use img_dir_name instead of transforms.json if found"""
     normal_format: Literal["omnidata", "dsine"] = "omnidata"
+    batch_size: int = 100
+    """Inference batch size. On RTX 4090 or similar (24GB VRAM), 40-50 is recommended to avoid OOM; reduce further on smaller GPUs."""
 
     def main(self):
         if (
@@ -70,10 +72,16 @@ class NormalsFromPretrained:
             ]
             if self.normal_format == "omnidata":
                 if self.resolution == "low":
-                    run_monocular_normals(images=image_paths, save_path=self.save_path)
+                    run_monocular_normals(
+                        images=image_paths,
+                        save_path=self.save_path,
+                        batch_size=self.batch_size,
+                    )
                 else:
                     run_monocular_normals_hd(
-                        images=image_paths, save_path=self.save_path
+                        images=image_paths,
+                        save_path=self.save_path,
+                        batch_size=self.batch_size,
                     )
             elif self.normal_format == "dsine":
                 run_monocular_dsine(images=image_paths, save_path=self.save_path)
@@ -89,10 +97,16 @@ class NormalsFromPretrained:
             ]
             if self.normal_format == "omnidata":
                 if self.resolution == "low":
-                    run_monocular_normals(images=image_paths, save_path=self.save_path)
+                    run_monocular_normals(
+                        images=image_paths,
+                        save_path=self.save_path,
+                        batch_size=self.batch_size,
+                    )
                 else:
                     run_monocular_normals_hd(
-                        images=image_paths, save_path=self.save_path
+                        images=image_paths,
+                        save_path=self.save_path,
+                        batch_size=self.batch_size,
                     )
             elif self.normal_format == "dsine":
                 run_monocular_dsine(images=image_paths, save_path=self.save_path)
@@ -167,12 +181,14 @@ def run_monocular_normals(
     images: List[Path],
     save_path: Path,
     omnidata_pretrained_weights_path: Path = Path("omnidata_ckpt"),
+    batch_size: int = 100,
 ) -> None:
     """Generates normal maps from pretrained omnidata
     Args:
         images: list of image paths
         save_path: path to save directory
         omnidata_pretrained_weights_path: omnidata weights path
+        batch_size: inference batch size (default 100; use 40-50 on 24GB GPUs to avoid OOM)
 
     Returns:
         None
@@ -208,7 +224,6 @@ def run_monocular_normals(
     model.eval()
 
     image_list = images
-    batch_size = BATCH_SIZE
     num_workers = min(16, os.cpu_count() or 4)
 
     # Parallel load all images to CPU, resize to model input, then bulk transfer to GPU
@@ -269,12 +284,14 @@ def run_monocular_normals_hd(
     images: List[Path],
     save_path: Path,
     omnidata_pretrained_weights_path: Path = Path("omnidata_ckpt"),
+    batch_size: int = 100,
 ) -> None:
     """Generates hd normal maps from pretrained omnidata
     Args:
         images: list of image paths
         save_path: path to save directory
         omnidata_pretrained_weights_path: omnidata weights path
+        batch_size: inference batch size (default 100; use 40-50 on 24GB GPUs to avoid OOM)
 
     Returns:
         None
@@ -306,7 +323,10 @@ def run_monocular_normals_hd(
     image_patches = get_filename_list(image_pathces_folder)
 
     run_monocular_normals(
-        image_patches, normal_patches_folder, omnidata_pretrained_weights_path
+        image_patches,
+        normal_patches_folder,
+        omnidata_pretrained_weights_path,
+        batch_size=batch_size,
     )
 
     merge_patches(rgbs, normal_patches_folder, save_path, x, y, H, W)
@@ -351,8 +371,7 @@ def normals_from_pretrain(
     model.to(device)
 
     image_list = sorted([file for file in image_folder.glob("*") if file.is_file()])
-
-    batch_size = BATCH_SIZE
+    batch_size = BATCH_SIZE  # used when normals_from_pretrain is called directly (e.g. from normals_from_omnidata_hd)
 
     for batch_index in range(0, len(image_list), batch_size):
         CONSOLE.print(
